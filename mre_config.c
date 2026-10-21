@@ -50,10 +50,25 @@ static int mre_env_int(const char *name, int fallback)
 	return atoi(v);
 }
 
-/* ini value as string; returns NULL when unset or empty */
+/*
+ * ini value as string; returns NULL when unset or empty.
+ *
+ * This deliberately does NOT use the INI_STR() macro: on PHP 7.x it expands
+ * to zend_ini_string_ex((name), sizeof(name)-1, ...), and applying sizeof()
+ * to our `const char *name` parameter truncated every lookup to the pointer
+ * size (7 bytes) - "mre.gtx_timeout" matched "mre.gtx" and every ini option
+ * silently fell back to its code default (container bug BUG-3).  8.0+
+ * switched the macro to strlen(name), so we call the underlying API with the
+ * real length on every version.  The 7.x prototype takes a non-const char*,
+ * hence the cast; the lookup never modifies the name.
+ */
 static const char *mre_ini_str(const char *name)
 {
-	const char *v = INI_STR(name);
+#if PHP_VERSION_ID < 80000
+	char *v = zend_ini_string_ex((char *)name, strlen(name), 0, NULL);
+#else
+	const char *v = zend_ini_string_ex(name, strlen(name), 0, NULL);
+#endif
 	if (v && *v != '\0') {
 		return v;
 	}
