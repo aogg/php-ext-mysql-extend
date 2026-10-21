@@ -8,6 +8,8 @@
 
 兼容 PHP **7.4 与 8.0 ~ 8.4**（源码内用 `PHP_VERSION_ID` 宏分支处理 API 差异），无任何外部库依赖（YAML 为内置精简解析器，不链接 libyaml）。
 
+7.x/8.x 差异处理要点：mysqlnd `fetch_row` 钩子（8.1+ 才有 `zval**/bool` 原型）整段用版本宏守卫，7.4/8.0 裸 `make` 通过；ini 读取不走 `INI_STR()` 宏（7.x 宏对指针参数做 `sizeof`，会把长键名截断），改为按真实长度调用 `zend_ini_string_ex()`；`mre.log_script` 的异常清理在引擎“逃逸栈顶帧”状态下完成（详见 `mre_script_run` 注释），7.4 下脚本抛异常同样降级告警而不是段错误。
+
 > 阶段A（核心：env/ini 配置、mysqlnd 捕获、redis 嗅探、日志写入、GA 编译）与阶段B
 > （YAML 规则引擎、脚本回调日志路径、跨 fpm 全局事务）均已完成，见下文与 `docs/设计.md`。
 
@@ -214,8 +216,8 @@ return null;                              // null/空/非字符串 -> 降级到 
 ## 捕获范围与已知限制
 
 MySQL（mysqlnd 层）：
-- 覆盖 mysqli / PDO_MYSQL 的普通查询、预处理语句（prepare/execute/get_result）、多语句 `next_result`、缓冲与非缓冲结果。
-- 行内容采样：mysqli 全覆盖；PDO 在 PHP 8.1+ 通过 `fetch_row` 包装覆盖，7.4/8.0 的 PDO 取行走 C 数组路径，仅记录元信息（SQL/行数/错误不受影响）。
+- 覆盖 mysqli / PDO_MYSQL 的普通查询、预处理语句（prepare/execute/get_result/**bind_result+fetch**）、多语句 `next_result`、缓冲与非缓冲结果。
+- 行内容采样：mysqli 全覆盖——`get_result` 与 `bind_result+fetch` 两条取行路径都采样（后者经 mysqlnd stmt `fetch` 钩子读取绑定变量，采样行不带 `rows` 总数元信息）；PDO 在 PHP 8.1+ 通过 `fetch_row` 包装覆盖，7.4/8.0 的 PDO 取行走 C 数组路径，仅记录元信息（SQL/行数/错误不受影响）。
 - 异步查询（`send_query/reap_query` 直用）未挂钩。
 
 Redis（streams 层）：
@@ -241,7 +243,7 @@ Redis（streams 层）：
 ├── mre_mysql.c                 # mysqlnd conn_data+stmt 方法表挂钩（含 gtx 拦截）
 ├── mre_redis.c                 # tcp 传输工厂包装 + RESP 双向增量解析
 ├── docs/设计.md                 # 架构设计、版本兼容、阶段B实现取舍
-├── tests/*.phpt                # 阶段A 2 条 + 阶段B 5 条（含多进程 gtx）
+├── tests/*.phpt                # 阶段A 2 条 + 阶段B 5 条 + 容器bug回归 2 条（ini 长键名/脚本异常降级）
 └── .github/workflows/build.yml # 7.4~8.4 矩阵编译打包
 ```
 
