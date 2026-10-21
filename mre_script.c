@@ -403,8 +403,43 @@ static zend_bool mre_script_run(const char *path, time_t mtime, long size,
 	zend_bool ok = (zend_bool)1;
 	char summary[256];
 
-	op = mre_script_compile(path, mtime, size, summary, sizeof(summary));
+	/*
+	 * Run the callback the way the engine itself runs top-level code:
+	 * with EG(current_execute_data) == NULL, zend_execute() pushes a
+	 * ZEND_CALL_TOP_CODE frame whose symbol table is the global one, so
+	 * the callback sees $context in the globals exactly like {main} does.
+	 *
+	 * The NULL frame is also the state the executor leaves behind when an
+	 * uncaught exception escapes that top frame (7.4 and 8.x alike), and
+	 * it must still be in effect while the exception is summarized and
+	 * cleared:
+	 *   - zend_call_function() takes its dedicated dummy-frame path for
+	 *     the getMessage() probe, instead of poking the interrupted frame
+	 *     (7.4 reads EG(current_execute_data)->opline->opcode there);
+	 *   - zend_clear_exception() skips its writeback of
+	 *     EG(opline_before_exception) - a pointer INTO the script's
+	 *     op_array - into EG(current_execute_data)->opline.
+	 *
+	 * The previous order restored the caller frame first and only then
+	 * cleared, so on 7.4 the writeback stamped that foreign opline into
+	 * the very frame the engine was about to resume (7.4 dereferences
+	 * ->opline of the current frame in zend_call_function's fake-frame
+	 * logic and zend_throw_exception_internal), taking the process down
+	 * with SIGSEGV as soon as a log script threw (container bug BUG-2;
+	 * 8.1+ hardened this unwind path and masked it).
+	 */
+	pending = EG(exception);
+	prev_ed = EG(current_execute_data);
+	EG(current_execute_data) = NULL;
+
+	zend_try {
+		op = mre_script_compile(path, mtime, size, summary, sizeof(summary));
+	} zend_catch {
+		EG(current_execute_data) = prev_ed;
+		zend_bailout();
+	} zend_end_try();
 	if (!op) {
+		EG(current_execute_data) = prev_ed;
 		mre_script_warn(path, summary);
 		return (zend_bool)0;
 	}
@@ -413,19 +448,26 @@ static zend_bool mre_script_run(const char *path, time_t mtime, long size,
 	mre_ctx_build(&ctx, ci);
 	zend_hash_str_update(&EG(symbol_table), "context", 7, &ctx);
 
-	pending = EG(exception);
-	prev_ed = EG(current_execute_data);
-	EG(current_execute_data) = NULL;
-
-	zend_execute(op, retval);
-
-	EG(current_execute_data) = prev_ed;
+	zend_try {
+		zend_execute(op, retval);
+	} zend_catch {
+		/* exit()/fatal inside the callback: restore what we own, then
+		 * let the bailout unwind the request as the engine expects */
+		EG(current_execute_data) = prev_ed;
+		EG(exception) = pending;
+		zend_hash_str_del(&EG(symbol_table), "context", 7);
+		zend_bailout();
+	} zend_end_try();
 
 	if (EG(exception) && EG(exception) != pending) {
 		mre_exception_summary(summary, sizeof(summary));
 		zend_clear_exception();
 		ok = (zend_bool)0;
 	}
+
+	/* resume the interrupted frame only after our exception is gone */
+	EG(current_execute_data) = prev_ed;
+
 	/* keep whatever exception the interrupted code had pending */
 	EG(exception) = pending;
 
