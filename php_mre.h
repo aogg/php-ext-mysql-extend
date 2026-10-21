@@ -81,10 +81,13 @@ typedef struct {
 	zend_bool enable;                              /* MRE_ENABLE       */
 	zend_bool capture_mysql;                       /* MRE_CAPTURE_MYSQL*/
 	zend_bool capture_redis;                       /* MRE_CAPTURE_REDIS*/
+	zend_bool gtx;                                 /* MRE_GTX          */
 	int       json_format;                         /* MRE_LOG_FORMAT   */
 	int       redis_port;                          /* MRE_REDIS_PORT   */
 	int       sample_rows;                         /* MRE_SAMPLE_ROWS  */
+	int       gtx_timeout;                         /* MRE_GTX_TIMEOUT  */
 	char      log_file[MRE_PATH_MAX];              /* MRE_LOG_FILE     */
+	char      log_script[MRE_PATH_MAX];            /* MRE_LOG_SCRIPT   */
 	char      state_dir[MRE_PATH_MAX];             /* MRE_STATE_DIR    */
 	char      yaml_config[MRE_PATH_MAX];           /* MRE_YAML_CONFIG  */
 } mre_config;
@@ -119,13 +122,19 @@ typedef struct {
 void mre_extra_init(mre_extra *e);
 
 /* ------------------------------------------------------------------ */
-/* Logger (mre_log.c)                                                  */
-/* One line per record; append + flock; process-cached handle.         */
-/* Never allocates Zend memory: usable from hooks at any time.         */
+/* Route resolution (stage B): which file receives one record           */
+/* Priority: log_script return > yaml rule > mre.log_file               */
 /* ------------------------------------------------------------------ */
+zend_bool mre_route_resolve(const char *type, const char *dir,
+                            const char *content, size_t content_len,
+                            const mre_extra *extra,
+                            char *out, size_t out_cap);
+
 void mre_log_write(const char *type, const char *dir,
                    const char *content, size_t content_len,
                    const mre_extra *extra);
+void mre_log_write_main(const char *type, const char *content);
+                    /* un-routed record to the main log (warnings) */
 void mre_log_close(void);           /* MSHUTDOWN / GSHUTDOWN */
 
 /* ------------------------------------------------------------------ */
@@ -165,6 +174,66 @@ void mre_yaml_config_ensure(void);  /* load / reload when file changed */
 void mre_yaml_config_free(void);    /* MSHUTDOWN */
 
 /* ------------------------------------------------------------------ */
+/* YAML rule engine (mre_rules.c) - stage B                             */
+/* Compiles "rules:" entries to PCRE2 once per yaml (re)load; routes a  */
+/* record to the first matching rule's log_file, else default_log_file. */
+/* ------------------------------------------------------------------ */
+zend_bool mre_rules_sync(void);    /* rebuild when the yaml tree changed */
+zend_bool mre_rules_route(const char *type, const char *content,
+                          size_t content_len, char *out, size_t cap);
+void mre_rules_free(void);         /* MSHUTDOWN */
+zend_bool mre_rules_dump_to_zval(zval *rules_out, zval *default_out);
+                    /* effective rule list + default_log_file for dump */
+
+/* ------------------------------------------------------------------ */
+/* Log-script callback (mre_script.c) - stage B                         */
+/* Runs mre.log_script per record; its `return 'path';` selects the     */
+/* log file. Any failure degrades to the caller's fallback.             */
+/* ------------------------------------------------------------------ */
+void mre_script_rinit(void);       /* per request: enable + drop cache  */
+void mre_script_rshutdown(void);   /* disable until the next request    */
+zend_bool mre_script_route(const char *type, const char *dir,
+                           const char *content, size_t content_len,
+                           const mre_extra *extra,
+                           char *out, size_t cap);
+
+/* ------------------------------------------------------------------ */
+/* Cross-fpm global transaction (mre_gtx.c) - stage B                   */
+/* ------------------------------------------------------------------ */
+/* per connection gtx state, embedded in the mysql connection context   */
+typedef struct {
+	zend_bool tracked;             /* registered in the open window     */
+	zend_bool pending;             /* COMMIT intercepted, deferred      */
+	int       epoch;               /* request epoch of last stat check  */
+	char      key[128];            /* unique connection key             */
+} mre_gtx_ctx;
+
+void mre_gtx_rinit(void);          /* bump per-request check epoch      */
+
+/* userland API (implemented in mre_gtx.c) */
+PHP_FUNCTION(mre_gtx_begin);
+PHP_FUNCTION(mre_gtx_commit);
+PHP_FUNCTION(mre_gtx_rollback);
+PHP_FUNCTION(mre_gtx_status);
+
+/* sql classification bitmask (shared by the mysqlnd hooks) */
+#define MRE_GTX_Q_NONE     0x00
+#define MRE_GTX_Q_BEGIN    0x01
+#define MRE_GTX_Q_COMMIT   0x02
+#define MRE_GTX_Q_ROLLBACK 0x04
+int mre_gtx_sql_kind(const char *sql, size_t len);
+
+#if MRE_HAVE_MYSQLND
+/* returns 1 when the call must be swallowed (deferred COMMIT)          */
+zend_bool mre_gtx_pre_call(MYSQLND_CONN_DATA *conn, mre_gtx_ctx *gx,
+                           const char *query, size_t qlen, int qkind);
+void mre_gtx_post_call(MYSQLND_CONN_DATA *conn, mre_gtx_ctx *gx,
+                       zend_bool ok, const char *query, int qkind);
+zend_bool mre_mysql_raw_send(MYSQLND_CONN_DATA *conn, const char *sql);
+void mre_gtx_conn_closed(MYSQLND_CONN_DATA *conn, mre_gtx_ctx *gx);
+#endif
+
+/* ------------------------------------------------------------------ */
 /* MySQL capture (mre_mysql.c) - mysqlnd methods table override        */
 /* ------------------------------------------------------------------ */
 #if MRE_HAVE_MYSQLND
@@ -192,6 +261,7 @@ size_t mre_json_escape(const char *in, size_t in_len,
                        char *out, size_t out_cap);     /* out NUL-term   */
 void mre_copy_str(char *dst, size_t dst_cap,
                   const char *src, size_t src_len);    /* NUL-term copy  */
+void mre_makedirs(const char *path);                   /* mkdir -p       */
 
 /* ------------------------------------------------------------------ */
 /* Module globals                                                      */
@@ -206,6 +276,37 @@ ZEND_BEGIN_MODULE_GLOBALS(mre)
 	char          *yaml_path;        /* pestrdup'd loaded path */
 	time_t         yaml_mtime;
 	zend_bool      yaml_warned;     /* warn once per process on parse errors */
+
+	/* rule engine cache (mre_rules.c; pointers are malloc'ed, not Zend) */
+	void          *rules;            /* mre_rule array */
+	size_t         rules_count;
+	char          *rules_default_log;/* yaml default_log_file */
+	char          *rules_src_path;   /* yaml path rules were built from */
+	time_t         rules_src_mtime;
+	const void    *rules_src_root;   /* yaml root pointer rules were built from */
+
+	/* log script cache (mre_script.c); per request, never freed by hand */
+	zend_bool      script_available;/* 1 between RINIT and RSHUTDOWN     */
+	void          *script_oparray;  /* compiled script op_array          */
+	time_t         script_mtime;    /* mtime of the compiled version     */
+	long           script_size;     /* size of the compiled version      */
+	zend_bool      script_warned;   /* one-time degradation warning      */
+	zend_bool      script_busy;     /* re-entrancy guard                 */
+
+	/* global transaction (mre_gtx.c) */
+	int            gtx_epoch;       /* bumped per request                */
+	char           gtx_reg_path[MRE_PATH_MAX]; /* resolved registry path */
+	time_t         gtx_snap_mtime;  /* registry snapshot cache           */
+	long           gtx_snap_size;
+	zend_bool      gtx_snap_valid;
+	int            gtx_snap_state;  /* 0 none 1 active 2 mark_rb 3 mark_c*/
+	char           gtx_snap_id[64];
+	long           gtx_snap_started;
+	long           gtx_snap_timeout;
+	long           gtx_snap_owner;
+	zend_bool      gtx_snap_expired;/* timeout hit (safety rollback)     */
+	char          *gtx_snap_conns;  /* packed conn entries (see mre_gtx.c)*/
+	size_t         gtx_snap_nconns;
 ZEND_END_MODULE_GLOBALS(mre)
 
 ZEND_EXTERN_MODULE_GLOBALS(mre)

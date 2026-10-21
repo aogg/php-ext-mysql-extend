@@ -125,6 +125,7 @@ void mre_config_refresh(void)
 	mre_cfg_bool(&cfg->enable, "MRE_ENABLE", "mre.enable", 0);
 	mre_cfg_bool(&cfg->capture_mysql, "MRE_CAPTURE_MYSQL", "mre.capture_mysql", 1);
 	mre_cfg_bool(&cfg->capture_redis, "MRE_CAPTURE_REDIS", "mre.capture_redis", 1);
+	mre_cfg_bool(&cfg->gtx, "MRE_GTX", "mre.gtx", 0);
 
 	{
 		const char *fmt = mre_env("MRE_LOG_FORMAT");
@@ -149,8 +150,18 @@ void mre_config_refresh(void)
 		cfg->sample_rows = 100;
 	}
 
+	mre_cfg_int(&cfg->gtx_timeout, "MRE_GTX_TIMEOUT", "mre.gtx_timeout", 300);
+	if (cfg->gtx_timeout < 10) {
+		cfg->gtx_timeout = 10;
+	}
+	if (cfg->gtx_timeout > 86400) {
+		cfg->gtx_timeout = 86400;
+	}
+
 	mre_cfg_str(cfg->log_file, sizeof(cfg->log_file),
 		"MRE_LOG_FILE", "mre.log_file");
+	mre_cfg_str(cfg->log_script, sizeof(cfg->log_script),
+		"MRE_LOG_SCRIPT", "mre.log_script");
 	mre_cfg_str(cfg->state_dir, sizeof(cfg->state_dir),
 		"MRE_STATE_DIR", "mre.state_dir");
 	mre_cfg_str(cfg->yaml_config, sizeof(cfg->yaml_config),

@@ -25,6 +25,9 @@
 ZEND_BEGIN_ARG_INFO_EX(arginfo_mre_yaml_dump, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_mre_gtx_void, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
 PHP_FUNCTION(mre_yaml_dump)
 {
 	mre_yaml_dump_to_zval(return_value);
@@ -32,6 +35,10 @@ PHP_FUNCTION(mre_yaml_dump)
 
 static const zend_function_entry mre_functions[] = {
 	PHP_FE(mre_yaml_dump, arginfo_mre_yaml_dump)
+	PHP_FE(mre_gtx_begin, arginfo_mre_gtx_void)
+	PHP_FE(mre_gtx_commit, arginfo_mre_gtx_void)
+	PHP_FE(mre_gtx_rollback, arginfo_mre_gtx_void)
+	PHP_FE(mre_gtx_status, arginfo_mre_gtx_void)
 	PHP_FE_END
 };
 
@@ -61,12 +68,15 @@ PHP_INI_BEGIN()
 	PHP_INI_ENTRY("mre.enable",        "0",    PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.log_file",      "",     PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.log_format",    "json", PHP_INI_ALL, NULL)
+	PHP_INI_ENTRY("mre.log_script",    "",     PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.capture_mysql", "1",    PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.capture_redis", "1",    PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.redis_port",    "6379", PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.sample_rows",   "1",    PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.state_dir",     "",     PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.yaml_config",   "",     PHP_INI_ALL, NULL)
+	PHP_INI_ENTRY("mre.gtx",           "0",    PHP_INI_ALL, NULL)
+	PHP_INI_ENTRY("mre.gtx_timeout",   "300",  PHP_INI_ALL, NULL)
 PHP_INI_END()
 
 /* ------------------------------------------------------------------ */
@@ -93,6 +103,7 @@ PHP_MSHUTDOWN_FUNCTION(mre)
 {
 	mre_redis_mshutdown();
 	mre_mysql_mshutdown();
+	mre_rules_free();
 	mre_yaml_config_free();
 	mre_log_close();
 	UNREGISTER_INI_ENTRIES();
@@ -107,6 +118,10 @@ PHP_RINIT_FUNCTION(mre)
 	/* load / reload yaml rules when the file changed */
 	mre_yaml_config_ensure();
 
+	/* stage B: per-request script cache + gtx check epoch */
+	mre_script_rinit();
+	mre_gtx_rinit();
+
 	/* keep our hooks in place if someone re-registered over them */
 	mre_redis_rehook();
 	mre_mysql_reassert();
@@ -116,6 +131,8 @@ PHP_RINIT_FUNCTION(mre)
 
 PHP_RSHUTDOWN_FUNCTION(mre)
 {
+	/* executing the log script after the executor shuts down is unsafe */
+	mre_script_rshutdown();
 	return SUCCESS;
 }
 
@@ -157,6 +174,15 @@ PHP_MINFO_FUNCTION(mre)
 	mre_info_value_row("sample_rows (MRE_SAMPLE_ROWS)", samplebuf);
 	mre_info_value_row("state_dir (MRE_STATE_DIR)", cfg->state_dir);
 	mre_info_value_row("yaml_config (MRE_YAML_CONFIG)", cfg->yaml_config);
+	mre_info_value_row("log_script (MRE_LOG_SCRIPT)", cfg->log_script);
+	{
+		char gtxbuf[32];
+		snprintf(gtxbuf, sizeof(gtxbuf), "%d", cfg->gtx_timeout);
+		mre_info_value_row("gtx (MRE_GTX)", cfg->gtx ? "1" : "0");
+		mre_info_value_row("gtx_timeout (MRE_GTX_TIMEOUT)", gtxbuf);
+	}
+	mre_info_value_row("effective rules",
+		(MRE_G(rules_count) > 0) ? "loaded (see mre_yaml_dump())" : "none");
 #if MRE_HAVE_MYSQLND
 	mre_info_value_row("mysqlnd capture", "available");
 #else

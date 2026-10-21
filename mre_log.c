@@ -52,54 +52,6 @@ static void mre_lbuf_appendf(char *buf, size_t cap, size_t *len, const char *fmt
 /* helpers                                                              */
 /* ------------------------------------------------------------------ */
 
-/* create all missing parent directories of path (like mkdir -p) */
-static void mre_log_makedirs(const char *path)
-{
-	char buf[MRE_PATH_MAX];
-	size_t i, len;
-
-	if (!path || !*path) {
-		return;
-	}
-	len = strlen(path);
-	if (len >= sizeof(buf)) {
-		return;
-	}
-	memcpy(buf, path, len + 1);
-
-	/* only the directory part */
-	for (i = len; i > 0; i--) {
-		if (buf[i - 1] == '/') {
-			break;
-		}
-	}
-	if (i == 0) {
-		return; /* relative file without directory component */
-	}
-	buf[i - 1] = '\0';
-	if (buf[0] == '\0') {
-		return; /* root dir */
-	}
-
-	/* walk the path creating each component */
-	for (i = 1; buf[i] != '\0'; i++) {
-		if (buf[i] == '/') {
-			buf[i] = '\0';
-#ifdef PHP_WIN32
-			_mkdir(buf);
-#else
-			mkdir(buf, 0777);
-#endif
-			buf[i] = '/';
-		}
-	}
-#ifdef PHP_WIN32
-	_mkdir(buf);
-#else
-	mkdir(buf, 0777);
-#endif
-}
-
 static zend_bool mre_is_special(const char *path, const char *what)
 {
 	return path != NULL && strcasecmp(path, what) == 0;
@@ -149,7 +101,7 @@ static FILE *mre_log_target(const char *path)
 		MRE_G(log_fp_path) = NULL;
 	}
 
-	mre_log_makedirs(path);
+	mre_makedirs(path);
 	fp = fopen(path, "a");
 	if (!fp) {
 		mre_log_warn_once(path);
@@ -288,48 +240,26 @@ void mre_extra_init(mre_extra *e)
 	memset(e, 0, sizeof(*e));
 }
 
-void mre_log_write(const char *type, const char *dir,
-                   const char *content, size_t content_len,
-                   const mre_extra *extra)
+/* core emitter: format one record and append it to `target` */
+static void mre_log_emit_record(const char *target,
+                                const char *type, const char *dir,
+                                const char *content, size_t content_len,
+                                const mre_extra *extra)
 {
-	const mre_config *cfg;
 	char line[MRE_LOG_LINE_MAX];
 	char esc[MRE_JSON_VAL_MAX];
 	char tsbuf[40];
 	size_t len = 0;
 	FILE *fp;
 
-	/* config might not be resolved yet (e.g. MINIT time) - resolve lazily */
-	if (!MRE_G(cfg_valid)) {
-		mre_config_refresh();
-	}
-	cfg = &MRE_G(cfg);
-
-	if (!cfg->enable) {
-		return;
-	}
-#ifdef MRE_DBG_NOLOG
-	return;
-#endif
-
-	fp = mre_log_target(cfg->log_file);
+	fp = mre_log_target(target);
 	if (!fp) {
-		if (cfg->log_file[0] == '\0') {
-			/* no target configured: degrade to stderr, warn once */
-			if (!MRE_G(log_open_warned)) {
-				MRE_G(log_open_warned) = (zend_bool)1;
-				fprintf(stderr, "[mre] warning: mre.enable=1 but mre.log_file is empty; "
-					"logs go to stderr until a log file is configured\n");
-			}
-			fp = stderr;
-		} else {
-			return; /* open failure was already reported once */
-		}
+		return; /* open failure was already reported once */
 	}
 
 	mre_iso8601_now(tsbuf, sizeof(tsbuf));
 
-	if (cfg->json_format) {
+	if (MRE_G(cfg).json_format) {
 		char typebuf[16], dirbuf[16];
 
 		mre_json_escape(type, type ? strlen(type) : 0, typebuf, sizeof(typebuf));
@@ -356,6 +286,68 @@ void mre_log_write(const char *type, const char *dir,
 	line[len] = '\0';
 
 	mre_log_emit(fp, line, len);
+}
+
+void mre_log_write(const char *type, const char *dir,
+                   const char *content, size_t content_len,
+                   const mre_extra *extra)
+{
+	const mre_config *cfg;
+	char target[MRE_PATH_MAX];
+
+	/* config might not be resolved yet (e.g. MINIT time) - resolve lazily */
+	if (!MRE_G(cfg_valid)) {
+		mre_config_refresh();
+	}
+	cfg = &MRE_G(cfg);
+
+	if (!cfg->enable) {
+		return;
+	}
+#ifdef MRE_DBG_NOLOG
+	return;
+#endif
+
+	/* stage B: pick the destination for this record.  Priority:
+	 * log_script return value > yaml rule > mre.log_file */
+	target[0] = '\0';
+	if (!mre_route_resolve(type, dir, content, content_len, extra,
+			target, sizeof(target))) {
+		mre_copy_str(target, sizeof(target),
+			cfg->log_file, strlen(cfg->log_file));
+	}
+
+	if (target[0] == '\0') {
+		/* no target configured: degrade to stderr, warn once (stage A) */
+		if (!MRE_G(log_open_warned)) {
+			MRE_G(log_open_warned) = (zend_bool)1;
+			fprintf(stderr, "[mre] warning: mre.enable=1 but mre.log_file is empty; "
+				"logs go to stderr until a log file is configured\n");
+		}
+		mre_copy_str(target, sizeof(target), "stderr", 6);
+	}
+
+	mre_log_emit_record(target, type, dir, content, content_len, extra);
+}
+
+/* un-routed record straight into the main log (used for warnings:
+ * must never recurse back into route resolution) */
+void mre_log_write_main(const char *type, const char *content)
+{
+	const mre_config *cfg;
+	const char *target;
+
+	if (!MRE_G(cfg_valid)) {
+		mre_config_refresh();
+	}
+	cfg = &MRE_G(cfg);
+
+	if (cfg->log_file[0] != '\0') {
+		target = cfg->log_file;
+	} else {
+		target = "stderr"; /* no main log configured */
+	}
+	mre_log_emit_record(target, type, "", content, strlen(content), NULL);
 }
 
 void mre_log_close(void)

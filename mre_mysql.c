@@ -32,6 +32,7 @@ typedef struct {
 	zend_bool sampling;            /* sampling active for current result   */
 	uint64_t rows_total;           /* rows in current (buffered) result    */
 	uint64_t fetched;              /* sampled rows so far                  */
+	mre_gtx_ctx gtx;               /* stage B: global transaction state    */
 } mre_mysql_ctx;
 
 /* originals (possibly already chained by another plugin) */
@@ -63,6 +64,25 @@ static zend_bool mre_mysql_enabled(void)
 		mre_config_refresh();
 	}
 	return (zend_bool)(MRE_G(cfg).enable && MRE_G(cfg).capture_mysql);
+}
+
+/* stage B: send a raw statement bypassing our own hooks (used by the
+ * global transaction finalize: ROLLBACK / COMMIT) */
+zend_bool mre_mysql_raw_send(MYSQLND_CONN_DATA *conn, const char *sql)
+{
+	if (!conn || !mre_orig_query || !sql) {
+		return (zend_bool)0;
+	}
+	return (zend_bool)(mre_orig_query(conn, sql, strlen(sql)) == PASS);
+}
+
+/* gtx flag: independent from logging (works with mre.enable=0) */
+static zend_bool mre_gtx_enabled(void)
+{
+	if (!MRE_G(cfg_valid)) {
+		mre_config_refresh();
+	}
+	return MRE_G(cfg).gtx;
 }
 
 static mre_mysql_ctx *mre_ctx_get(MYSQLND_CONN_DATA *conn)
@@ -339,17 +359,41 @@ static enum_func_status mre_hook_query(MYSQLND_CONN_DATA * conn,
                                        const char * const query,
                                        const size_t query_len)
 {
-	enum_func_status ret = mre_orig_query(conn, query, query_len);
+	enum_func_status ret;
+	mre_mysql_ctx *ctx = mre_ctx_get(conn);
+	int qkind = mre_gtx_sql_kind(query, query_len);
+	zend_bool gtx_on = mre_gtx_enabled();
+
+	/* stage B: transaction control interception happens BEFORE the
+	 * statement reaches the server */
+	if (gtx_on && ctx
+			&& mre_gtx_pre_call(conn, &ctx->gtx, query, query_len, qkind)) {
+		/* COMMIT intercepted and deferred: report success, tx stays open */
+		if (mre_mysql_enabled()) {
+			mre_extra e;
+
+			mre_extra_conn(&e, conn);
+			mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, query,
+				MIN(query_len, (size_t)(MRE_MAX_SQL_LOG - 1)), &e);
+
+			mre_extra_conn(&e, conn);
+			e.has_affected = (zend_bool)1;
+			e.affected = 0;
+			mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_RESP,
+				"GTX_COMMIT_DEFERRED", sizeof("GTX_COMMIT_DEFERRED") - 1, &e);
+		}
+		return PASS;
+	}
+
+	ret = mre_orig_query(conn, query, query_len);
 
 	if (mre_mysql_enabled() && query) {
 		mre_extra e;
-		mre_mysql_ctx *ctx;
 
 		mre_extra_conn(&e, conn);
 		mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, query,
 			MIN(query_len, (size_t)(MRE_MAX_SQL_LOG - 1)), &e);
 
-		ctx = mre_ctx_get(conn);
 		if (ctx) {
 			mre_ctx_remember_sql(ctx, query, query_len);
 		}
@@ -367,6 +411,11 @@ static enum_func_status mre_hook_query(MYSQLND_CONN_DATA * conn,
 			mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_RESP, "OK",
 				sizeof("OK") - 1, &e);
 		}
+	}
+
+	if (gtx_on && ctx) {
+		mre_gtx_post_call(conn, &ctx->gtx, (zend_bool)(ret == PASS),
+			query, qkind);
 	}
 	return ret;
 }
@@ -431,6 +480,10 @@ static void mre_hook_dtor(MYSQLND_CONN_DATA * conn)
 			(mre_mysql_ctx **)mysqlnd_plugin_get_plugin_connection_data_data(
 				conn, mre_plugin_id);
 		if (slot && *slot) {
+			/* stage B: a tracked connection leaving must leave the window */
+			if ((*slot)->gtx.tracked || (*slot)->gtx.pending) {
+				mre_gtx_conn_closed(conn, &(*slot)->gtx);
+			}
 			pefree(*slot, conn->persistent);
 			*slot = NULL;
 		}
@@ -499,7 +552,51 @@ static MYSQLND_RES *mre_hook_stmt_get_result(MYSQLND_STMT * const stmt)
 
 static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 {
-	enum_func_status ret = mre_orig_stmt_execute(stmt);
+	enum_func_status ret;
+	MYSQLND_STMT_DATA *d;
+	MYSQLND_CONN_DATA *conn;
+	mre_mysql_ctx *ctx;
+	int qkind = MRE_GTX_Q_NONE;
+	zend_bool gtx_on = mre_gtx_enabled();
+
+	if (stmt && stmt->data) {
+		d = stmt->data;
+		conn = d->conn;
+		ctx = conn ? mre_ctx_get(conn) : NULL;
+		qkind = ctx ? mre_gtx_sql_kind(ctx->sql, ctx->sql_len)
+		            : MRE_GTX_Q_NONE;
+
+		if (gtx_on && ctx && qkind != MRE_GTX_Q_NONE
+				&& mre_gtx_pre_call(conn, &ctx->gtx, ctx->sql, ctx->sql_len,
+					qkind)) {
+			/* deferred COMMIT via prepared statement: report success */
+			if (mre_mysql_enabled()) {
+				mre_extra e;
+
+				mre_extra_conn(&e, conn);
+				e.has_stmt = (zend_bool)1;
+				e.stmt_id = d->stmt_id;
+				mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, "COMMIT",
+					sizeof("COMMIT") - 1, &e);
+
+				mre_extra_conn(&e, conn);
+				e.has_stmt = (zend_bool)1;
+				e.stmt_id = d->stmt_id;
+				e.has_affected = (zend_bool)1;
+				e.affected = 0;
+				mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_RESP,
+					"GTX_COMMIT_DEFERRED",
+					sizeof("GTX_COMMIT_DEFERRED") - 1, &e);
+			}
+			return PASS;
+		}
+	} else {
+		d = NULL;
+		conn = NULL;
+		ctx = NULL;
+	}
+
+	ret = mre_orig_stmt_execute(stmt);
 
 	if (mre_mysql_enabled() && stmt && stmt->data) {
 		MYSQLND_STMT_DATA *d = stmt->data;
@@ -544,6 +641,11 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 		resp_word = e.has_error ? "ERROR" : "EXECUTED";
 		resp_len = e.has_error ? sizeof("ERROR") - 1 : sizeof("EXECUTED") - 1;
 		mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_RESP, resp_word, resp_len, &e);
+	}
+
+	if (gtx_on && ctx) {
+		mre_gtx_post_call(conn, &ctx->gtx, (zend_bool)(ret == PASS),
+			ctx->sql, qkind);
 	}
 	return ret;
 }

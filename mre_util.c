@@ -78,6 +78,56 @@ void mre_iso8601_now(char *buf, size_t cap)
 }
 
 /* ------------------------------------------------------------------ */
+/* mre_makedirs: create all missing parent directories (mkdir -p)       */
+/* ------------------------------------------------------------------ */
+void mre_makedirs(const char *path)
+{
+	char buf[MRE_PATH_MAX];
+	size_t i, len;
+
+	if (!path || !*path) {
+		return;
+	}
+	len = strlen(path);
+	if (len >= sizeof(buf)) {
+		return;
+	}
+	memcpy(buf, path, len + 1);
+
+	/* only the directory part */
+	for (i = len; i > 0; i--) {
+		if (buf[i - 1] == '/') {
+			break;
+		}
+	}
+	if (i == 0) {
+		return; /* relative file without directory component */
+	}
+	buf[i - 1] = '\0';
+	if (buf[0] == '\0') {
+		return; /* root dir */
+	}
+
+	/* walk the path creating each component */
+	for (i = 1; buf[i] != '\0'; i++) {
+		if (buf[i] == '/') {
+			buf[i] = '\0';
+#ifdef PHP_WIN32
+			_mkdir(buf);
+#else
+			mkdir(buf, 0777);
+#endif
+			buf[i] = '/';
+		}
+	}
+#ifdef PHP_WIN32
+	_mkdir(buf);
+#else
+	mkdir(buf, 0777);
+#endif
+}
+
+/* ------------------------------------------------------------------ */
 /* mre_json_escape: escape a string for JSON                            */
 /* - quotes, backslash and control chars are escaped                    */
 /* - bytes >= 0x80 pass through unchanged (UTF-8 stays UTF-8)           */

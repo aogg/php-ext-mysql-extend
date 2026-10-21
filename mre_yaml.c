@@ -779,9 +779,22 @@ zend_bool mre_yaml_dump_to_zval(zval *return_value)
 	mre_config_refresh();
 	mre_yaml_config_ensure();
 	if (!MRE_G(yaml_root)) {
-		ZVAL_NULL(return_value);
+		ZVAL_NULL(return_value); /* stage A behaviour: null without config */
 		return (zend_bool)0;
 	}
+
 	mre_y_node_to_zval(MRE_G(yaml_root), return_value);
+
+	/* stage B: append the effective (compiled) rule list */
+	{
+		zval rules, def;
+
+		mre_rules_sync();
+		mre_rules_dump_to_zval(&rules, &def);
+		add_assoc_zval_ex(return_value, "rules_compiled",
+			sizeof("rules_compiled") - 1, &rules);
+		add_assoc_zval_ex(return_value, "default_log_file",
+			sizeof("default_log_file") - 1, &def);
+	}
 	return (zend_bool)1;
 }
