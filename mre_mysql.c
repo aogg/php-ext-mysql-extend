@@ -44,6 +44,7 @@ static func_mysqlnd_conn_data__dtor       mre_orig_dtor;
 static func_mysqlnd_stmt__prepare         mre_orig_stmt_prepare;
 static func_mysqlnd_stmt__execute         mre_orig_stmt_execute;
 static func_mysqlnd_stmt__get_result      mre_orig_stmt_get_result;
+static func_mysqlnd_stmt__fetch           mre_orig_stmt_fetch;
 static func_mysqlnd_res__fetch_into       mre_orig_fetch_into;
 static mysqlnd_fetch_row_func             mre_orig_fetch_row;
 
@@ -195,7 +196,14 @@ static void mre_hook_fetch_into(MYSQLND_RES *result, const unsigned int flags,
 	mre_mysql_sample_row(result, return_value);
 }
 
-/* 8.1+: PDO fetches rows through m.fetch_row (zval** row) - wrap it too */
+/* 8.1+: PDO fetches rows through m.fetch_row (zval** row) - wrap it too.
+ * The definition must stay behind the same version guard as its forward
+ * declaration and its assignment in mre_patch_result(): on 7.4/8.0 the
+ * mysqlnd fetch_row prototype still uses `void *param, zend_bool *` (the
+ * `zval **row, bool *` shape only exists on 8.1+, where Zend finally
+ * provides the `bool` type).  Compiling this body unguarded broke the
+ * 7.4/8.0 build with "unknown type name 'bool'" (container bug BUG-1). */
+#if PHP_VERSION_ID >= 80100
 static enum_func_status mre_hook_fetch_row(MYSQLND_RES *result, zval **row,
                                            const unsigned int flags,
                                            bool *fetched_anything)
@@ -208,6 +216,7 @@ static enum_func_status mre_hook_fetch_row(MYSQLND_RES *result, zval **row,
 	}
 	return ret;
 }
+#endif /* PHP_VERSION_ID >= 80100 */
 
 /* ------------------------------------------------------------------ */
 /* row sampling: instance hooks on the result's embedded method table   */
@@ -262,29 +271,16 @@ static void mre_log_result_meta(MYSQLND_CONN_DATA *conn, MYSQLND_RES *res,
 	mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_RESP, "result", sizeof("result") - 1, &e);
 }
 
-/* shared row sampler: format + log one fetched row */
-static void mre_mysql_sample_row(MYSQLND_RES *result, zval *row)
+/* shared row formatter: consumes one sample budget unit and logs the row */
+static void mre_mysql_log_row(MYSQLND_CONN_DATA *conn, mre_mysql_ctx *ctx,
+                              zval *row)
 {
-	mre_mysql_ctx *ctx;
 	mre_extra e;
 	char rowdump[MRE_ROW_DUMP_MAX + 16];
 	size_t rd = 0;
 	zend_ulong cell_idx = 0;
 	zval *zv;
 
-	if (!result || !result->conn || !mre_mysql_enabled()) {
-		return;
-	}
-	if (!row || Z_TYPE_P(row) != IS_ARRAY) {
-		return;
-	}
-	if (zend_hash_num_elements(Z_ARRVAL_P(row)) == 0) {
-		return;
-	}
-	ctx = mre_ctx_get(result->conn);
-	if (!ctx || !ctx->sampling || ctx->samples_left <= 0) {
-		return;
-	}
 	ctx->samples_left--;
 	ctx->fetched++;
 
@@ -340,7 +336,7 @@ static void mre_mysql_sample_row(MYSQLND_RES *result, zval *row)
 		cell_idx++;
 	} ZEND_HASH_FOREACH_END();
 
-	mre_extra_conn(&e, result->conn);
+	mre_extra_conn(&e, conn);
 	e.has_fetched = (zend_bool)1;
 	e.fetched = ctx->fetched;
 	if (ctx->rows_total > 0) {
@@ -350,6 +346,66 @@ static void mre_mysql_sample_row(MYSQLND_RES *result, zval *row)
 	e.truncated = (zend_bool)(cell_idx >= MRE_ROW_CELLS_MAX
 		|| rd >= sizeof(rowdump) - 8);
 	mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_RESP, rowdump, rd, &e);
+}
+
+/* shared row sampler: format + log one fetched row */
+static void mre_mysql_sample_row(MYSQLND_RES *result, zval *row)
+{
+	mre_mysql_ctx *ctx;
+
+	if (!result || !result->conn || !mre_mysql_enabled()) {
+		return;
+	}
+	if (!row || Z_TYPE_P(row) != IS_ARRAY) {
+		return;
+	}
+	if (zend_hash_num_elements(Z_ARRVAL_P(row)) == 0) {
+		return;
+	}
+	ctx = mre_ctx_get(result->conn);
+	if (!ctx || !ctx->sampling || ctx->samples_left <= 0) {
+		return;
+	}
+	mre_mysql_log_row(result->conn, ctx, row);
+}
+
+/* row sampler for the stmt bind_result()+fetch() path: the fetched values
+ * land in the bound userland variables (stmt->data->result_bind), not in a
+ * zval array this version's m.fetch_row prototype would hand us, so copy
+ * them into a temporary row array and run the shared sampler */
+static void mre_mysql_sample_stmt_row(MYSQLND_STMT * const stmt)
+{
+	MYSQLND_STMT_DATA *d = stmt ? stmt->data : NULL;
+	mre_mysql_ctx *ctx;
+	zval row;
+	unsigned int i;
+
+	if (!d || !d->conn || !d->result_bind || d->field_count == 0) {
+		return; /* no bind_result(): nothing to sample here */
+	}
+	if (!mre_mysql_enabled()) {
+		return;
+	}
+	ctx = mre_ctx_get(d->conn);
+	if (!ctx || !ctx->sampling || ctx->samples_left <= 0) {
+		return;
+	}
+
+	array_init(&row);
+	for (i = 0; i < d->field_count; i++) {
+		zval *zv = &d->result_bind[i].zv;
+
+		if (Z_TYPE_P(zv) == IS_REFERENCE) {
+			zv = Z_REFVAL_P(zv);
+		}
+		if (!zv || Z_TYPE_P(zv) == IS_UNDEF) {
+			continue;
+		}
+		Z_TRY_ADDREF_P(zv);
+		add_next_index_zval(&row, zv);
+	}
+	mre_mysql_log_row(d->conn, ctx, &row);
+	zval_ptr_dtor(&row);
 }
 
 /* ------------------------------------------------------------------ */
@@ -550,6 +606,20 @@ static MYSQLND_RES *mre_hook_stmt_get_result(MYSQLND_STMT * const stmt)
 	return res;
 }
 
+/* bind_result()+fetch(): on every version this path goes through the stmt
+ * method table's fetch() (not through res::fetch_into / m.fetch_row with a
+ * usable row array), so sample the bound variables here */
+static enum_func_status mre_hook_stmt_fetch(MYSQLND_STMT * const stmt,
+                                            zend_bool * const fetched_anything)
+{
+	enum_func_status ret = mre_orig_stmt_fetch(stmt, fetched_anything);
+
+	if (PASS == ret && fetched_anything && *fetched_anything) {
+		mre_mysql_sample_stmt_row(stmt);
+	}
+	return ret;
+}
+
 static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 {
 	enum_func_status ret;
@@ -684,10 +754,12 @@ void mre_mysql_minit(void)
 		mre_orig_stmt_prepare = cur->prepare;
 		mre_orig_stmt_execute = cur->execute;
 		mre_orig_stmt_get_result = cur->get_result;
+		mre_orig_stmt_fetch = cur->fetch;
 
 		mre_stmt_methods.prepare = mre_hook_stmt_prepare;
 		mre_stmt_methods.execute = mre_hook_stmt_execute;
 		mre_stmt_methods.get_result = mre_hook_stmt_get_result;
+		mre_stmt_methods.fetch = mre_hook_stmt_fetch;
 
 		mysqlnd_stmt_set_methods(&mre_stmt_methods);
 	}
