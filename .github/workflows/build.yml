@@ -1,0 +1,64 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: php ${{ matrix.php-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest (24.04): shivammathur/setup-php supports PHP 7.4+ there;
+        # for very old PHP (<=7.3) you would have to pin ubuntu-22.04.
+        php-version: ["7.4", "8.0", "8.1", "8.2", "8.3", "8.4"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          coverage: none
+          tools: phpize, php-config
+
+      - name: Build (phpize && configure && make)
+        run: |
+          phpize
+          ./configure --enable-mre
+          make -j"$(nproc)"
+
+      - name: Show build warnings
+        if: always()
+        run: |
+          grep -i "warning" $(find . -name "*.log" 2>/dev/null) || true
+
+      - name: Smoke test (load extension)
+        run: |
+          set -e
+          # distro-style layouts keep mysqlnd in a separate mysqlnd.so which must
+          # load first; source-built PHP (setup-php) has mysqlnd built in.
+          if [ -f "$(php-config --extension-dir)/mysqlnd.so" ]; then
+            php -d extension=mysqlnd -d extension=./modules/mre.so -r 'echo "mre loaded (with mysqlnd.so)\n";'
+          else
+            php -d extension=./modules/mre.so -r 'echo "mre loaded\n";'
+          fi
+          php -d extension=./modules/mre.so -i | grep -A 3 "^mre$"
+
+      - name: Package
+        run: |
+          mkdir -p out
+          cp modules/mre.so out/
+          tar -czf mre-${{ matrix.php-version }}-linux-x86_64.tar.gz -C out mre.so
+          ls -la mre-*.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mre-${{ matrix.php-version }}-linux-x86_64
+          path: mre-${{ matrix.php-version }}-linux-x86_64.tar.gz
+          if-no-files-found: error

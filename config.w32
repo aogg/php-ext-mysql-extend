@@ -1,0 +1,15 @@
+// config.w32 for extension mre
+// Windows builds are secondary for mre (target deployments are Linux/docker),
+// but the project stays buildable so `configure.js --enable-mre` works.
+// The streams/RESP capture works on Windows too; mysqlnd capture requires a
+// mysqlnd-enabled build (default for Windows php-src builds).
+
+ARG_ENABLE("mre", "enable mre (mysql-redis-extend) support", "no");
+
+if (PHP_MRE != "no") {
+	EXTENSION("mre",
+		"mre.c mre_config.c mre_util.c mre_log.c mre_yaml.c mre_mysql.c mre_redis.c",
+		PHP_MRE_SHARED,
+		"/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+	AC_DEFINE("HAVE_MRE_MYSQLND", 1, "mysqlnd headers available (Windows core builds include mysqlnd)");
+}
