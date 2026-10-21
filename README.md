@@ -8,7 +8,8 @@
 
 兼容 PHP **7.4 与 8.0 ~ 8.4**（源码内用 `PHP_VERSION_ID` 宏分支处理 API 差异），无任何外部库依赖（YAML 为内置精简解析器，不链接 libyaml）。
 
-> 阶段A（本仓库当前状态）：扩展核心。YAML 规则引擎、脚本回调日志路径、跨 fpm 全局事务为下一阶段（设计见 `docs/设计.md`）。
+> 阶段A（核心：env/ini 配置、mysqlnd 捕获、redis 嗅探、日志写入、GA 编译）与阶段B
+> （YAML 规则引擎、脚本回调日志路径、跨 fpm 全局事务）均已完成，见下文与 `docs/设计.md`。
 
 ## 编译（phpize 三步）
 
@@ -51,8 +52,11 @@ php -i | grep -A 14 '^mre$'
 | `mre.capture_redis` | `MRE_CAPTURE_REDIS` | `1` | Redis 捕获开关 |
 | `mre.redis_port` | `MRE_REDIS_PORT` | `6379` | redis 嗅探端口（只有连到该端口的 tcp 流会被嗅探） |
 | `mre.sample_rows` | `MRE_SAMPLE_ROWS` | `1` | 每个结果集采样记录的行数（0 表示不采样内容，只记元信息；上限 100） |
-| `mre.state_dir` | `MRE_STATE_DIR` | 空 | 状态文件目录（下一阶段全局事务的注册表位置；本阶段仅读取配置） |
-| `mre.yaml_config` | `MRE_YAML_CONFIG` | 空 | YAML 规则文件路径（本阶段仅加载解析，规则应用在下一阶段；文件变化自动重载） |
+| `mre.state_dir` | `MRE_STATE_DIR` | 空（默认 `/tmp`） | 状态目录（全局事务注册表位置；为空时 gtx 使用 `/tmp`） |
+| `mre.yaml_config` | `MRE_YAML_CONFIG` | 空 | YAML 规则文件路径（规则格式见下文；文件变化自动热加载并重编译正则） |
+| `mre.log_script` | `MRE_LOG_SCRIPT` | 空 | PHP 脚本绝对路径。启用后每条记录写日志前执行该脚本，脚本 `return '路径'` 决定本条记录的日志文件（详见下文） |
+| `mre.gtx` | `MRE_GTX` | `0` | 跨 fpm 全局事务开关。**默认关闭**，防止生产误开；开启后 `mre_gtx_*` 函数才可用 |
+| `mre.gtx_timeout` | `MRE_GTX_TIMEOUT` | `300` | 全局事务窗口最长存活秒数（10~86400），超时后第一次访问自动判定窗口失效并全部回滚（安全优先） |
 
 php.ini 示例：
 
@@ -101,11 +105,111 @@ text 格式（`mre.log_format=text`）：
 
 截断策略：SQL ≤ 4096 字节；redis 命令 ≤ 2048 字节（单参数 ≤ 256）；redis 响应摘要 ≤ 512 字节；采样行 ≤ 512 字节（16 列、单列 ≤ 64）。超限置 `extra.truncated=true`。
 
+## 日志路由（阶段B）
+
+每条记录写日志前会先做一次“目标解析”，优先级：**脚本返回路径 > yaml 规则 > `mre.log_file`**。路由只改变“写到哪个文件”，记录格式与 flock 机制不变。脚本与 yaml 可同时启用。
+
+### YAML 规则文件（`mre.yaml_config`）
+
+```yaml
+rules:
+  - name: slow-select          # 可选，排障用
+    type: mysql                # mysql | redis，省略表示都匹配
+    match: "/SELECT .* FROM slow_.*/i"   # PCRE 正则（preg 风格定界符+修饰符）
+    log_file: /var/log/mre/slow.log
+  - name: redis-del
+    type: redis
+    match: "^DEL "
+    log_file: /var/log/mre/redis-danger.log
+default_log_file: /var/log/mre/default.log
+```
+
+- 规则**有序，首条命中生效**；都不中落到 `default_log_file`；yaml 没有 `default_log_file` 时用 `mre.log_file` 主日志。
+- `match` 支持 preg 风格定界符与修饰符 `i m s x u U A`（如 `/pattern/i`）；不带合法定界符时整个字符串按 pattern 本体使用。编译失败会在 stderr 告警（含规则名与 PCRE2 错误信息）并跳过该条，不影响其他规则。
+- 正则在 yaml 加载/热加载时用 PCRE2 编译一次并缓存，匹配路径零编译开销。
+- 兼容别名：`log:` 等价于 `log_file:`（设计文档历史写法）。
+- `mre_yaml_dump()` 输出包含 `rules_compiled`（当前生效规则列表，含 `compiled` 编译状态）与 `default_log_file`，是规则排障入口。
+
+### 脚本回调（`mre.log_script`）
+
+值为 PHP 脚本**绝对路径**。每条记录写日志前执行一次该脚本（不做跨请求缓存；脚本内容按 mtime+size 缓存编译结果，同一请求内同版本只编译一次）。脚本 `return '路径'` 即本条记录的目标日志文件：
+
+```php
+<?php
+// $context 由扩展注入；$_SERVER/$_POST/$_GET/$_COOKIE 原样可读
+if ($context['type'] === 'mysql' && strpos($context['content'], 'slow_') !== false) {
+    return '/var/log/mre/slow.log';       // 本条记录写这里
+}
+if (!empty($_POST['debug'])) {
+    return '/tmp/mre-debug.log';
+}
+return null;                              // null/空/非字符串 -> 降级到 规则/主日志
+```
+
+脚本执行时收到的 `$context` 数组（全部字段）：
+
+| 键 | 值 |
+|---|---|
+| `type` | `mysql` 或 `redis` |
+| `dir` | `req` 或 `resp` |
+| `content` | SQL 或 redis 命令/响应文本 |
+| `extra` | 行数/错误信息数组（`affected_rows`/`rows`/`fetched_rows`/`fields`/`stmt_id`/`error_code`/`error`/`sqlstate`/`host`/`port`/`truncated`，仅含存在项） |
+| `headers` | 当前 HTTP 请求全部 header（由 `$_SERVER` 的 `HTTP_*` 与 `CONTENT_TYPE`/`CONTENT_LENGTH` 整理成 `小写名 => 值`，如 `x-foo-bar`；CLI 下为 `[]`） |
+| `post` | `$_POST` 原样 |
+| `cookie` | `$_COOKIE` 原样 |
+| `get` | `$_GET` 原样 |
+| `session_id` | `session_id()` 的值（未启动为空串） |
+| `uri` | `$_SERVER['REQUEST_URI'] ?? ''` |
+| `method` | `$_SERVER['REQUEST_METHOD'] ?? ''` |
+
+`$_SERVER` 原样可读（扩展只读不写，其余超全局同样不被污染；脚本返回后注入的 `$context` 会被立即移除）。
+
+降级与防护：
+- 脚本返回 `null`/空串/非字符串，或抛异常/致命错误（含解析错误）：降级写 **规则路由结果或 `mre.log_file`**，并在主日志记一条一次性 `type:"warn"` 告警（含异常消息摘要）。脚本错误绝不会让 PHP 进程崩溃或请求失败。
+- 执行前后保存并恢复引擎异常状态与执行栈帧；脚本输出（echo）被捕获丢弃。
+- 局限：脚本内 `exit()/die()` 仍会按 PHP 语义终止当前请求（与 auto_prepend_file 同理）；脚本内发起的 SQL/redis 记录不会再递归调用脚本本身（防重入），而是直接走规则/主日志。
+
+### 优先级示例
+
+脚本与 yaml 同时启用时：命中 `DANGER` 的记录走脚本返回的文件；脚本返回 `null` 的记录走 yaml 规则；无规则命中走 `mre.log_file`。
+
+## 跨 fpm 全局事务（mre.gtx=1）
+
+通过一组 PHP 函数开启“全局事务窗口”，窗口期间**任意 fpm 进程、任意 mysqli/PDO 连接**开启的普通事务都归属其中，最后由一次命令统一提交或回滚：
+
+| 函数 | 说明 |
+|---|---|
+| `mre_gtx_begin(): bool` | 开启窗口（生成 gtx_id，注册表写入 `mre.state_dir`）。已有存活窗口时返回 `false` |
+| `mre_gtx_rollback(): bool` | 注册表打 rollback 标记 → 各持有跟踪连接的进程在下一次 mysqlnd 调用入口对自己本地的打开事务**真实发送 ROLLBACK**，全部移除后窗口自动结束 |
+| `mre_gtx_commit(): bool` | 同上，标记 commit → 各进程真实发送 COMMIT 后清场结束窗口 |
+| `mre_gtx_status(): array` | 返回 `active`(bool)、`state`(`active`/`mark_rollback`/`mark_commit`/`none`/`disabled`)、`gtx_id`、`started_at`、`tracked_connections`、`owner_pid`、`timeout` |
+
+语义细节：
+
+1. **归属**：窗口开启期间，连接的事务被自动登记——显式 `BEGIN`/`START TRANSACTION`，或 autocommit 关闭后的首个语句（通过服务端 `SERVER_STATUS_IN_TRANS` 状态检测），同时覆盖 mysqli/PDO 及一切 mysqlnd 连接类。
+2. **延迟 COMMIT**：跟踪中的连接发起 `COMMIT`（`mysqli::commit()`/`PDO::commit()`/SQL `COMMIT`）时被拦截——不发给 server，函数返回 `true` 但事务保持打开；该连接“有未决 commit”记入注册表。
+3. **统一收尾**：`mre_gtx_rollback()`/`mre_gtx_commit()` 只在注册表打标记（微秒级持锁）；各持有跟踪连接的进程在“下一次 mysqlnd 调用入口”（query/prepare/execute 钩子）检查标记，先真实发送 ROLLBACK/COMMIT，再关闭事务、清 pending、从注册表移除自己；最后一个条目移除后窗口自动结束（注册表文件删除）。
+4. **崩溃安全**：注册表条目带 pid+时间戳；rollback/commit 清场时对已死进程（`kill(pid,0)` 判活）条目直接清理。窗口超过 `mre.gtx_timeout`（默认 300s）后，第一次访问自动判定窗口失效并标记全部回滚（安全优先）。
+5. **开销控制**：注册表检查使用进程内 (mtime,size) 快照缓存——每请求每连接最多一次 `stat()`；事务控制语句（BEGIN/COMMIT/ROLLBACK）强制刷新检查。
+
+**局限**（务必了解）：
+
+- 真实 ROLLBACK/COMMIT 依赖“该连接的下一次 mysqlnd 调用”：若一个进程的跟踪连接之后再无任何数据库调用，其收尾会推迟到连接关闭（服务端断开回滚）或窗口超时清理。
+- 拦截针对连接级：全局窗口开启期间，窗口内连接的**所有** COMMIT 都会被延迟（这是特性也是约束——需要细粒度独立事务的连接不应在窗口期间开启事务）。
+- 连接若带未读结果集（unbuffered）时执行强制 ROLLBACK/COMMIT 会触发“commands out of sync”，该次收尾失败仍会注销连接（服务端最终回滚）；建议在结果集取完后再进入全局事务窗口。
+- 业务主动发 `ROLLBACK` 视为退出窗口（连接注销，不再被收尾管理）。
+- 注册表为 `<state_dir>/mre-gtx.reg` 行式文本 + `<state_dir>/mre-gtx.lock`（flock 串行化读改写，数据文件 rename 原子替换），格式见 `docs/设计.md` §9。
+- Windows 无 `kill()` 判活，死进程清理降级为仅超时清理（本扩展以 Linux 部署为主）。
+
 ## 导出的 PHP 函数
 
 | 函数 | 说明 |
 |---|---|
-| `mre_yaml_dump(): ?array` | 返回当前已加载的 yaml 配置树（数组形式），未配置/解析失败返回 `null`。用于验证规则文件（下一阶段规则引擎的排障入口） |
+| `mre_yaml_dump(): ?array` | 返回当前已加载的 yaml 配置树 + `rules_compiled`（生效规则列表）+ `default_log_file`；未配置/解析失败返回 `null`。规则引擎排障入口 |
+| `mre_gtx_begin(): bool` | 开启全局事务窗口（需 `mre.gtx=1`） |
+| `mre_gtx_commit(): bool` | 全局提交标记 |
+| `mre_gtx_rollback(): bool` | 全局回滚标记 |
+| `mre_gtx_status(): array` | 窗口状态（详见上节） |
 
 ## 捕获范围与已知限制
 
@@ -128,12 +232,16 @@ Redis（streams 层）：
 ├── php_mre.h                   # 公共头：常量/配置结构/全局/各模块原型
 ├── mre.c                       # 模块生命周期、INI 注册、MINFO、函数表
 ├── mre_config.c                # env(MRE_*) > ini(mre.*) 配置解析
-├── mre_util.c                  # ISO8601 时间、JSON 转义、安全拷贝
-├── mre_log.c                   # 统一日志写入器（flock/句柄缓存/降级）
+├── mre_util.c                  # ISO8601 时间、JSON 转义、安全拷贝、mkdir -p
+├── mre_log.c                   # 统一日志写入器（flock/句柄缓存/降级/路由接入）
 ├── mre_yaml.c                  # 内置精简 YAML 解析器（映射/序列/块标量/注释）
-├── mre_mysql.c                 # mysqlnd conn_data+stmt 方法表挂钩
+├── mre_rules.c                 # yaml 规则引擎（PCRE2 编译缓存 + 首中路由）
+├── mre_script.c                # 日志路径脚本回调（zend_compile_file 缓存 + 隔离执行）
+├── mre_gtx.c                   # 跨 fpm 全局事务（注册表 + flock + mysqlnd 入口检查）
+├── mre_mysql.c                 # mysqlnd conn_data+stmt 方法表挂钩（含 gtx 拦截）
 ├── mre_redis.c                 # tcp 传输工厂包装 + RESP 双向增量解析
-├── docs/设计.md                 # 架构设计、版本兼容、下一阶段规划
+├── docs/设计.md                 # 架构设计、版本兼容、阶段B实现取舍
+├── tests/*.phpt                # 阶段A 2 条 + 阶段B 5 条（含多进程 gtx）
 └── .github/workflows/build.yml # 7.4~8.4 矩阵编译打包
 ```
 
