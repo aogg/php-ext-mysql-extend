@@ -14,8 +14,20 @@ MYSQLARGS="${MYSQL_ARGS:--uroot -proot}"
 dexec() { docker exec "$@"; }
 run_php() { # run_php <logfile> [env k=v ...] -- php args...
   local log="$1"; shift
-  dexec -e MRE_ENABLE=1 -e MRE_LOG_FILE="$log" "$@" "$CONTAINER" \
-    php -d extension="$EXT" -d xdebug.mode=off
+  # docker exec stops flag parsing at the first positional (container name):
+  # leading "-e V" pairs must stay in front of $CONTAINER, the script path
+  # must follow php.  Accumulate env pairs unquoted -- busybox ash has no
+  # arrays; every env value used below is space-free (r2 fix, was: "$@"
+  # placed before "$CONTAINER" so docker exec took the script path as the
+  # container name).
+  local envs=""
+  while [ "$#" -ge 2 ] && [ "$1" = "-e" ]; do
+    envs="$envs -e $2"
+    shift 2
+  done
+  # shellcheck disable=SC2086
+  dexec -e MRE_ENABLE=1 -e MRE_LOG_FILE="$log" $envs "$CONTAINER" \
+    php -d extension="$EXT" -d xdebug.mode=off "$@"
 }
 check() { dexec "$CONTAINER" php /tmp/mre-test/scripts/check_log.php "$@"; }
 db() { docker exec "$MYSQLC" mysql $MYSQLARGS -e "$1" 2>/dev/null; }

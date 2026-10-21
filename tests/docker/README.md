@@ -30,15 +30,16 @@ phpize && ./configure --enable-mre && make -j"$(nproc)"
 # 产物 /tmp/mre-test/src/modules/mre.so
 ```
 
-> **PHP 7.4 / 8.0 注意（BUG-1）**：7.4.33 上原样 `make` 失败
-> （`mre_mysql.c:201: error: unknown type name 'bool'`）。不改源码的绕过：
+> **PHP 7.4 / 8.0 注意（BUG-1，已修复）**：7.4.33 上曾原样 `make` 失败
+> （`mre_mysql.c:201: error: unknown type name 'bool'`），不改源码的绕过：
 >
 > ```sh
 > CF=$(grep -E '^CFLAGS = ' Makefile | head -1 | sed 's/^CFLAGS = //')
 > make -j"$(nproc)" CFLAGS="$CF -include stdbool.h"
 > ```
 >
-> 8.1+ 无此问题，原样 make 即可。
+> a315d6e 起 fetch_row 钩子定义已加版本守卫：7.4/8.0 原样 `make clean && make` 通过
+> （复测见 `docs/测试报告-容器实测.md` 复测轮2 R1），上述绕过不再需要。8.1+ 无此问题。
 
 ## 测试库表
 
@@ -75,7 +76,17 @@ CONTAINER=8.4-alpine-php-dev bash run-matrix.sh s10     # 8.4 复跑 S1/S4/S5
 | s9 | 开关项 capture_redis=0 / sample_rows=0,3 / enable=0 | t09_ops.php |
 | s10 | 8.4：重跑 s1 + s4 + s5 | 同上 |
 | probe | 采样路径矩阵（assoc/array/fetch_row/object/use_result/stmt 两路径） | t11_fetch.php |
-| repro | BUG-2 最小复现（script 抛异常 → 7.4 SIGSEGV / 8.4 正常降级） | t12_crashrepro.php + cb_t12.php |
+| repro | BUG-2 最小复现（script 抛异常 → 7.4 SIGSEGV / 8.4 正常降级；2963935 修复后轮2 复测 7.4 仍 139，未关单） | t12_crashrepro.php + cb_t12.php |
+| inionly | BUG-3 复现/回归（纯 ini 部署，无 MRE_* env；7c19265 修复后 7.4 日志创建 + mre.gtx_timeout 原值生效） | t13_inionly.php |
+
+ini-only 用法（容器内直跑，不得带任何 `-e MRE_*`）：
+
+```sh
+docker exec 7.4-alpine-php-dev php -d extension=/tmp/mre-test/src/modules/mre.so \
+  -d mre.enable=1 -d mre.log_file=/tmp/mre-test/logs/t13-ini.json \
+  -d mre.gtx_timeout=777 /tmp/mre-test/scripts/t13_inionly.php
+# PASS：t13-timeout=777、exit=0、/tmp/mre-test/logs/t13-ini.json 创建且含 mysql req/resp 行
+```
 
 日志校验用 `scripts/check_log.php`（json-lines 逐行解析、计数、must_contain、
 text 格式正则、空行/半行检测）。
