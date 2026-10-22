@@ -173,6 +173,27 @@ void mre_makedirs(const char *path)
 }
 
 /* ------------------------------------------------------------------ */
+/* mre_fmt_double: shortest round-trippable double text                 */
+/* Tries "%.15G" first (readable: 0.1 stays "0.1"); only when the text  */
+/* does not read back bit-identical falls back to "%.17G" (exact).      */
+/* Used by bind-param rendering so logs keep full precision without the */
+/* 0.10000000000000001 noise of a blind %.17G.                          */
+/* ------------------------------------------------------------------ */
+void mre_fmt_double(double d, char *out, size_t out_cap)
+{
+	char tmp[64];
+
+	if (!out || out_cap == 0) {
+		return;
+	}
+	snprintf(tmp, sizeof(tmp), "%.15G", d);
+	if (strtod(tmp, NULL) != d) {
+		snprintf(tmp, sizeof(tmp), "%.17G", d);
+	}
+	mre_copy_str(out, out_cap, tmp, strlen(tmp));
+}
+
+/* ------------------------------------------------------------------ */
 /* mre_json_escape: escape a string for JSON                            */
 /* - quotes, backslash and control chars are escaped                    */
 /* - bytes >= 0x80 pass through unchanged (UTF-8 stays UTF-8)           */

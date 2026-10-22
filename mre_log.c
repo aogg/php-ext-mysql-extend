@@ -136,7 +136,63 @@ static void mre_log_emit(FILE *fp, const char *line, size_t len)
 /* "extra" renderers                                                    */
 /* ------------------------------------------------------------------ */
 
-static void mre_log_extra_json(char *buf, size_t cap, size_t *len, const mre_extra *e)
+/* render captured bind params as a bracketed JSON fragment:
+ * [18,"bob",null]  (values already JSON-escaped here).  Stops early with
+ * *truncated=1 when the buffer would overflow (log volume first).      */
+static void mre_params_fragment(const mre_extra *e, char *out, size_t cap,
+                                zend_bool *truncated)
+{
+	size_t len = 0;
+	unsigned int i;
+
+	out[0] = '\0';
+	*truncated = (zend_bool)(e->param_cap < e->param_total);
+	mre_lbuf_appendf(out, cap, &len, "[");
+	for (i = 0; i < e->param_cap; i++) {
+		const mre_param *p = &e->params[i];
+		char one[MRE_PARAM_TEXT_MAX + 48];
+		size_t one_len = 0;
+
+		if (i > 0) {
+			mre_lbuf_appendf(one, sizeof(one), &one_len, ",");
+		}
+		switch (p->kind) {
+			case MRE_PARAM_NULL:
+				mre_lbuf_appendf(one, sizeof(one), &one_len, "null");
+				break;
+			case MRE_PARAM_LONG:
+				mre_lbuf_appendf(one, sizeof(one), &one_len, "%lld",
+					(long long)p->lval);
+				break;
+			case MRE_PARAM_DOUBLE: {
+				char num[64];
+				mre_fmt_double(p->dval, num, sizeof(num));
+				mre_lbuf_appendf(one, sizeof(one), &one_len, "%s", num);
+				break;
+			}
+			case MRE_PARAM_BLOB:
+			case MRE_PARAM_STR:
+			default: {
+				char esc[MRE_PARAM_TEXT_MAX + 48];
+				mre_json_escape(p->sval, strlen(p->sval), esc, sizeof(esc));
+				mre_lbuf_appendf(one, sizeof(one), &one_len, "\"%s\"", esc);
+				break;
+			}
+		}
+		/* +2: keep room for the closing ']' and NUL */
+		if (len + one_len + 2 >= cap) {
+			*truncated = (zend_bool)1;
+			break;
+		}
+		memcpy(out + len, one, one_len);
+		len += one_len;
+		out[len] = '\0';
+	}
+	mre_lbuf_appendf(out, cap, &len, "]");
+}
+
+static void mre_log_extra_json(char *buf, size_t cap, size_t *len, const mre_extra *e,
+                               const char *esc_content)
 {
 	char tmp[128];
 	zend_bool first = (zend_bool)1;
@@ -150,6 +206,13 @@ static void mre_log_extra_json(char *buf, size_t cap, size_t *len, const mre_ext
 
 	mre_lbuf_appendf(buf, cap, len, "\"extra\":{");
 
+	if (e->has_cmd) {
+		char cmdbuf[16];
+
+		MRE_PUT_SEP();
+		mre_json_escape(e->cmd, strlen(e->cmd), cmdbuf, sizeof(cmdbuf));
+		mre_lbuf_appendf(buf, cap, len, "\"cmd\":\"%s\"", cmdbuf);
+	}
 	if (e->has_affected) {
 		MRE_PUT_SEP();
 		mre_lbuf_appendf(buf, cap, len, "\"affected_rows\":%llu", (unsigned long long)e->affected);
@@ -189,6 +252,29 @@ static void mre_log_extra_json(char *buf, size_t cap, size_t *len, const mre_ext
 		MRE_PUT_SEP();
 		mre_lbuf_appendf(buf, cap, len, "\"truncated\":true");
 	}
+	if (e->has_prepared) {
+		char frag[MRE_PARAMS_FRAG_MAX];
+		zend_bool ptrunc = (zend_bool)0;
+
+		MRE_PUT_SEP();
+		/* prepared.sql is defined to be the ?-SQL == content: reuse the
+		 * already escaped content text, no duplicate escaping or copy */
+		mre_params_fragment(e, frag, sizeof(frag), &ptrunc);
+		mre_lbuf_appendf(buf, cap, len,
+			"\"prepared\":{\"sql\":\"%s\",\"params\":%s",
+			esc_content ? esc_content : "", frag);
+		if (ptrunc) {
+			mre_lbuf_appendf(buf, cap, len, ",\"truncated\":true");
+		}
+		mre_lbuf_appendf(buf, cap, len, "}");
+	}
+	if (e->has_sql_full) {
+		char big[MRE_JSON_VAL_MAX];
+
+		MRE_PUT_SEP();
+		mre_json_escape(e->sql_full, strlen(e->sql_full), big, sizeof(big));
+		mre_lbuf_appendf(buf, cap, len, "\"sql_full\":\"%s\"", big);
+	}
 
 	mre_lbuf_appendf(buf, cap, len, "}");
 
@@ -198,8 +284,14 @@ static void mre_log_extra_json(char *buf, size_t cap, size_t *len, const mre_ext
 /* text format renderer: k=v pairs appended after content */
 static void mre_log_extra_text(char *buf, size_t cap, size_t *len, const mre_extra *e)
 {
+	char frag[MRE_PARAMS_FRAG_MAX];
+	zend_bool ptrunc = (zend_bool)0;
+
 	if (!e) {
 		return;
+	}
+	if (e->has_cmd) {
+		mre_lbuf_appendf(buf, cap, len, " cmd=%s", e->cmd);
 	}
 	if (e->has_affected) {
 		mre_lbuf_appendf(buf, cap, len, " affected_rows=%llu", (unsigned long long)e->affected);
@@ -228,6 +320,21 @@ static void mre_log_extra_text(char *buf, size_t cap, size_t *len, const mre_ext
 	}
 	if (e->truncated) {
 		mre_lbuf_appendf(buf, cap, len, " truncated=1");
+	}
+	if (e->has_prepared) {
+		/* params summary: the same bracketed JSON-ish fragment the json
+		 * format carries inside extra.prepared.params */
+		mre_params_fragment(e, frag, sizeof(frag), &ptrunc);
+		mre_lbuf_appendf(buf, cap, len, " params=%s", frag);
+		if (ptrunc) {
+			mre_lbuf_appendf(buf, cap, len, " params_truncated=1");
+		}
+	}
+	if (e->has_sql_full) {
+		char big[MRE_JSON_VAL_MAX];
+
+		mre_json_escape(e->sql_full, strlen(e->sql_full), big, sizeof(big));
+		mre_lbuf_appendf(buf, cap, len, " sql_full=\"%s\"", big);
 	}
 }
 
@@ -271,7 +378,7 @@ static void mre_log_emit_record(const char *target,
 			"{\"time\":\"%s\",\"pid\":%d,\"request_id\":\"%s\",\"type\":\"%s\",\"dir\":\"%s\",\"content\":\"%s\"",
 			tsbuf, (int)getpid(), mre_request_id_get(), typebuf, dirbuf, esc);
 		mre_lbuf_appendf(line, sizeof(line), &len, ",");
-		mre_log_extra_json(line, sizeof(line), &len, extra);
+		mre_log_extra_json(line, sizeof(line), &len, extra, esc);
 		mre_lbuf_appendf(line, sizeof(line), &len, "}");
 	} else {
 		mre_json_escape(content, content_len, esc, sizeof(esc));

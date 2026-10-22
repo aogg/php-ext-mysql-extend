@@ -61,6 +61,9 @@
 #define MRE_EXTRA_VAL_MAX   560   /* max rendered value per extra item */
 
 #define MRE_MAX_SQL_LOG     4096  /* SQL text cap in logs              */
+#define MRE_PARAM_MAX       32    /* max captured bind params          */
+#define MRE_PARAM_TEXT_MAX  256   /* one bind param value cap          */
+#define MRE_PARAMS_FRAG_MAX 2048  /* params json/text fragment budget  */
 #define MRE_ROW_CELL_MAX    64    /* one sampled row cell cap          */
 #define MRE_ROW_CELLS_MAX   16    /* max cells sampled per row         */
 #define MRE_ROW_DUMP_MAX    512   /* sampled row total cap             */
@@ -98,6 +101,25 @@ void mre_config_refresh(void);      /* env > ini into MRE_G(cfg) */
 /* ------------------------------------------------------------------ */
 /* Extra log fields (rendered into "extra" json object / k=v in text)  */
 /* ------------------------------------------------------------------ */
+
+/* one captured bind parameter (prepared statements).  `sval` holds the
+ * value text for strings ("raw, truncated with a "...(N)" suffix baked
+ * in) and blobs ("0x<hex>" summary, truncated with "...(N bytes)");    */
+typedef enum {
+	MRE_PARAM_NULL = 0,
+	MRE_PARAM_LONG,
+	MRE_PARAM_DOUBLE,
+	MRE_PARAM_STR,
+	MRE_PARAM_BLOB
+} mre_param_kind;
+
+typedef struct {
+	mre_param_kind kind;
+	zend_long      lval;
+	double         dval;
+	char           sval[MRE_PARAM_TEXT_MAX + 32];
+} mre_param;
+
 typedef struct {
 	zend_bool has_affected;
 	zend_bool has_rows;       /* rows in result set (buffered)        */
@@ -108,6 +130,14 @@ typedef struct {
 	zend_bool has_port;
 	zend_bool has_stmt;
 	zend_bool truncated;
+	zend_bool has_cmd;        /* mysql req only: query/prepare/execute */
+	char      cmd[10];
+	zend_bool has_prepared;   /* render extra.prepared {sql, params}  */
+	unsigned  param_total;    /* bound params reported by mysqlnd     */
+	unsigned  param_cap;      /* params captured (<= MRE_PARAM_MAX)   */
+	mre_param params[MRE_PARAM_MAX];
+	zend_bool has_sql_full;   /* extra.sql_full (? -> literals)       */
+	char      sql_full[MRE_MAX_SQL_LOG];
 	uint64_t  affected;
 	uint64_t  rows;
 	uint64_t  fetched;
@@ -260,6 +290,8 @@ void mre_redis_rehook(void);    /* per request: re-apply if replaced */
 void mre_iso8601_now(char *buf, size_t cap);           /* 2026-...+08:00 */
 size_t mre_json_escape(const char *in, size_t in_len,
                        char *out, size_t out_cap);     /* out NUL-term   */
+void mre_fmt_double(double d, char *out, size_t out_cap);
+                       /* shortest round-trippable double text          */
 void mre_copy_str(char *dst, size_t dst_cap,
                   const char *src, size_t src_len);    /* NUL-term copy  */
 void mre_makedirs(const char *path);                   /* mkdir -p       */

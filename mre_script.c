@@ -293,12 +293,28 @@ static void mre_ctx_entry_script(zval *out)
 	}
 }
 
+/* ------------------------------------------------------------------ */
+/* record context passed down to the builder                            */
+/* ------------------------------------------------------------------ */
+typedef struct {
+	const char      *type;
+	const char      *dir;
+	const char      *content;
+	size_t           content_len;
+	const mre_extra *extra;
+} mre_script_ctxinfo;
+
 /* extra[]: row counts / error info for the script */
-static void mre_ctx_extra(const mre_extra *e, zval *out)
+static void mre_ctx_extra(const mre_script_ctxinfo *ci, zval *out)
 {
+	const mre_extra *e = ci->extra;
+
 	array_init(out);
 	if (!e) {
 		return;
+	}
+	if (e->has_cmd) {
+		add_assoc_string_ex(out, "cmd", sizeof("cmd") - 1, e->cmd);
 	}
 	if (e->has_affected) {
 		add_assoc_long_ex(out, "affected_rows", sizeof("affected_rows") - 1,
@@ -333,6 +349,48 @@ static void mre_ctx_extra(const mre_extra *e, zval *out)
 	}
 	if (e->truncated) {
 		add_assoc_bool_ex(out, "truncated", sizeof("truncated") - 1, 1);
+	}
+	if (e->has_prepared) {
+		zval prepared;
+		zval params;
+		unsigned int i;
+
+		array_init(&prepared);
+		/* prepared.sql is the ?-SQL == content */
+		add_assoc_stringl_ex(&prepared, "sql", sizeof("sql") - 1,
+			ci->content ? ci->content : "",
+			ci->content ? ci->content_len : 0);
+		array_init(&params);
+		for (i = 0; i < e->param_cap; i++) {
+			const mre_param *p = &e->params[i];
+
+			switch (p->kind) {
+				case MRE_PARAM_NULL:
+					add_next_index_null(&params);
+					break;
+				case MRE_PARAM_LONG:
+					add_next_index_long(&params, p->lval);
+					break;
+				case MRE_PARAM_DOUBLE:
+					add_next_index_double(&params, p->dval);
+					break;
+				case MRE_PARAM_BLOB:
+				case MRE_PARAM_STR:
+				default:
+					add_next_index_string(&params, p->sval);
+					break;
+			}
+		}
+		if (e->param_cap < e->param_total) {
+			add_assoc_bool_ex(&prepared, "truncated",
+				sizeof("truncated") - 1, 1);
+		}
+		add_assoc_zval_ex(&prepared, "params", sizeof("params") - 1, &params);
+		add_assoc_zval_ex(out, "prepared", sizeof("prepared") - 1, &prepared);
+	}
+	if (e->has_sql_full) {
+		add_assoc_string_ex(out, "sql_full", sizeof("sql_full") - 1,
+			e->sql_full);
 	}
 }
 
@@ -371,17 +429,6 @@ static zend_bool mre_call_simple(const char *fn, size_t fn_len)
 	return (zend_bool)1;
 }
 
-/* ------------------------------------------------------------------ */
-/* record context passed down to the builder                            */
-/* ------------------------------------------------------------------ */
-typedef struct {
-	const char      *type;
-	const char      *dir;
-	const char      *content;
-	size_t           content_len;
-	const mre_extra *extra;
-} mre_script_ctxinfo;
-
 static void mre_ctx_build(zval *ctx, const mre_script_ctxinfo *ci)
 {
 	zval tmp;
@@ -393,7 +440,7 @@ static void mre_ctx_build(zval *ctx, const mre_script_ctxinfo *ci)
 	add_assoc_stringl_ex(ctx, "content", sizeof("content") - 1,
 		ci->content ? ci->content : "", ci->content_len);
 
-	mre_ctx_extra(ci->extra, &tmp);
+	mre_ctx_extra(ci, &tmp);
 	add_assoc_zval_ex(ctx, "extra", sizeof("extra") - 1, &tmp);
 
 	mre_ctx_headers(&tmp);

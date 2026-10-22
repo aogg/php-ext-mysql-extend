@@ -26,7 +26,9 @@
 /* per connection context (lives in the mysqlnd plugin data area)       */
 /* ------------------------------------------------------------------ */
 typedef struct {
-	char     sql[MRE_MAX_SQL_LOG]; /* last executed SQL (for EXECUTE etc.) */
+	char     sql[MRE_MAX_SQL_LOG]; /* last prepared/executed SQL, reused
+	                                verbatim as the execute-line content
+	                                (pure SQL, no "EXECUTE " prefix)     */
 	size_t   sql_len;
 	int      samples_left;         /* row sample budget for current result */
 	zend_bool sampling;            /* sampling active for current result   */
@@ -161,18 +163,243 @@ static void mre_patch_result(MYSQLND_RES *res);
 static void mre_log_result_meta(MYSQLND_CONN_DATA *conn, MYSQLND_RES *res,
                                 zend_bool unbuffered);
 
-/* "EXECUTE <last sql>" content for stmt execute logs */
-static void mre_stmt_content(char *buf, size_t cap, size_t *len,
-                             const mre_mysql_ctx *ctx)
+/* ------------------------------------------------------------------ */
+/* bind parameter capture (extra.cmd / extra.prepared / extra.sql_full) */
+/*                                                                      */
+/* At execute time mysqlnd's MYSQLND_STMT_DATA carries the bound values */
+/* in param_bind[i] = {zv, type} (type = MYSQL_TYPE_*, what mysqli's    */
+/* bind_param('i'/'d'/'s'/'b') and PDO's bindValue() handed over).  The */
+/* original execute call serializes exactly these entries, so reading   */
+/* them right before forwarding is a faithful picture of what is sent.  */
+/* ------------------------------------------------------------------ */
+
+/* one execute's captured bind state, rendered into mre_extra afterwards */
+typedef struct {
+	zend_bool    has_prepared;      /* 0 = nothing bound: omit fields  */
+	unsigned int param_total;       /* bound params reported by mysqlnd*/
+	unsigned int param_cap;         /* captured (<= MRE_PARAM_MAX)     */
+	mre_param    params[MRE_PARAM_MAX];
+	zend_bool    has_sql_full;
+	char         sql_full[MRE_MAX_SQL_LOG];
+} mre_prepared_info;
+
+/* render one captured param as an SQL literal (for extra.sql_full)     */
+static void mre_param_sql_literal(const mre_param *p, char *out, size_t cap)
 {
-	*len = 0;
-	mre_copy_str(buf, cap, "EXECUTE", sizeof("EXECUTE") - 1);
-	*len = strlen(buf);
-	if (ctx && ctx->sql_len > 0 && *len + 1 < cap) {
-		buf[(*len)++] = ' ';
-		mre_copy_str(buf + *len, cap - *len, ctx->sql, ctx->sql_len);
-		*len = strlen(buf);
+	switch (p->kind) {
+		case MRE_PARAM_NULL:
+			mre_copy_str(out, cap, "NULL", 4);
+			return;
+		case MRE_PARAM_LONG:
+			snprintf(out, cap, "%lld", (long long)p->lval);
+			return;
+		case MRE_PARAM_DOUBLE:
+			mre_fmt_double(p->dval, out, cap);
+			return;
+		case MRE_PARAM_BLOB:
+			mre_copy_str(out, cap, p->sval, strlen(p->sval));
+			return;
+		case MRE_PARAM_STR:
+		default: {
+			/* single-quoted literal; inner quotes doubled (''), no
+			 * backslash escaping (NO_BACKSLASH_ESCAPES semantics -
+			 * under other sql_mode a literal \\ is one byte off;
+			 * documented limitation, see README) */
+			size_t o = 0, i, n = strlen(p->sval);
+			if (cap < 3) {
+				return;
+			}
+			out[o++] = '\'';
+			/* o + 5: worst case iteration writes 3 bytes ('' + char),
+			 * then one closing quote and the NUL must still fit */
+			for (i = 0; i < n && o + 5 < cap; i++) {
+				if (p->sval[i] == '\'') {
+					out[o++] = '\'';
+				}
+				out[o++] = p->sval[i];
+			}
+			out[o++] = '\'';
+			out[o] = '\0';
+			return;
+		}
 	}
+}
+
+/* copy src into dst; when longer than MRE_PARAM_TEXT_MAX bytes cut there
+ * and append "…(N)" (N = the original byte length) */
+static void mre_param_text_truncate(char *dst, size_t dst_cap,
+                                    const char *src, size_t src_len)
+{
+	char suffix[40];
+
+	if (src_len <= MRE_PARAM_TEXT_MAX) {
+		mre_copy_str(dst, dst_cap, src, src_len);
+		return;
+	}
+	snprintf(suffix, sizeof(suffix), "…(%llu)",
+		(unsigned long long)src_len);
+	mre_copy_str(dst, dst_cap, src, MRE_PARAM_TEXT_MAX);
+	mre_copy_str(dst + MRE_PARAM_TEXT_MAX, dst_cap - MRE_PARAM_TEXT_MAX,
+		suffix, strlen(suffix));
+}
+
+/* capture one bound parameter (declared type wins, zval carries value) */
+static void mre_param_capture(mre_param *p, const MYSQLND_PARAM_BIND *pb)
+{
+	zval *zv = (zval *)&pb->zv;
+	const char *src = NULL;
+	size_t src_len = 0;
+
+	memset(p, 0, sizeof(*p));
+	if (Z_TYPE_P(zv) == IS_REFERENCE) {
+		zv = Z_REFVAL_P(zv);
+	}
+	if (pb->type == MYSQL_TYPE_NULL || !zv || Z_TYPE_P(zv) == IS_UNDEF
+			|| Z_TYPE_P(zv) == IS_NULL) {
+		p->kind = MRE_PARAM_NULL;
+		return;
+	}
+
+	switch (pb->type) {
+		case MYSQL_TYPE_TINY:
+		case MYSQL_TYPE_SHORT:
+		case MYSQL_TYPE_LONG:
+		case MYSQL_TYPE_LONGLONG:
+		case MYSQL_TYPE_YEAR:
+			p->kind = MRE_PARAM_LONG;
+			p->lval = zval_get_long(zv);
+			return;
+		case MYSQL_TYPE_DOUBLE:
+			p->kind = MRE_PARAM_DOUBLE;
+			p->dval = zval_get_double(zv);
+			return;
+		case MYSQL_TYPE_TINY_BLOB:
+		case MYSQL_TYPE_MEDIUM_BLOB:
+		case MYSQL_TYPE_LONG_BLOB:
+		case MYSQL_TYPE_BLOB: {
+			/* "0x" + up to 32 bytes of hex, "…(N bytes)" when cut */
+			static const char hexdig[] = "0123456789ABCDEF";
+			size_t used = 2, hex_bytes, i;
+			char suffix[40];
+
+			p->kind = MRE_PARAM_BLOB;
+			if (Z_TYPE_P(zv) == IS_STRING) {
+				src = Z_STRVAL_P(zv);
+				src_len = Z_STRLEN_P(zv);
+			}
+			hex_bytes = (src_len < 32) ? src_len : 32;
+			p->sval[0] = '0';
+			p->sval[1] = 'x';
+			for (i = 0; i < hex_bytes; i++) {
+				unsigned char c = (unsigned char)src[i];
+				p->sval[used++] = hexdig[c >> 4];
+				p->sval[used++] = hexdig[c & 0x0F];
+			}
+			p->sval[used] = '\0';
+			if (hex_bytes < src_len) {
+				snprintf(suffix, sizeof(suffix), "…(%llu bytes)",
+					(unsigned long long)src_len);
+				mre_copy_str(p->sval + used,
+					sizeof(p->sval) - used, suffix, strlen(suffix));
+			}
+			return;
+		}
+		default:
+			break;
+	}
+
+	/* VAR_STRING / STRING / DECIMAL / unknown: render by the value's own
+	 * type so the literal matches what mysqlnd serializes */
+	if (Z_TYPE_P(zv) == IS_LONG) {
+		p->kind = MRE_PARAM_LONG;
+		p->lval = Z_LVAL_P(zv);
+		return;
+	}
+	if (Z_TYPE_P(zv) == IS_DOUBLE) {
+		p->kind = MRE_PARAM_DOUBLE;
+		p->dval = Z_DVAL_P(zv);
+		return;
+	}
+	if (Z_TYPE_P(zv) == IS_TRUE) {
+		p->kind = MRE_PARAM_LONG;
+		p->lval = 1;
+		return;
+	}
+	if (Z_TYPE_P(zv) == IS_FALSE) {
+		p->kind = MRE_PARAM_LONG;
+		p->lval = 0;
+		return;
+	}
+	p->kind = MRE_PARAM_STR;
+	if (Z_TYPE_P(zv) == IS_STRING) {
+		mre_param_text_truncate(p->sval, sizeof(p->sval),
+			Z_STRVAL_P(zv), Z_STRLEN_P(zv));
+		return;
+	}
+	{
+		zend_string *zs = zval_get_string(zv);
+		mre_param_text_truncate(p->sval, sizeof(p->sval),
+			ZSTR_VAL(zs), ZSTR_LEN(zs));
+		zend_string_release(zs);
+	}
+}
+
+/* capture the statement's bound parameters (call before executing)     */
+static void mre_prepared_capture(mre_prepared_info *pi,
+                                 const MYSQLND_STMT_DATA *d,
+                                 const char *sql, size_t sql_len)
+{
+	unsigned int i;
+	size_t o = 0, j;
+	char lit[MRE_PARAM_TEXT_MAX + 40];
+	size_t lit_len, p = 0;
+
+	memset(pi, 0, sizeof(*pi));
+	pi->param_total = d->param_count;
+	if (!d->param_bind || d->param_count == 0) {
+		return; /* nothing bound: prepared/sql_full stay omitted */
+	}
+	pi->has_prepared = (zend_bool)1;
+	pi->param_cap = (d->param_count < MRE_PARAM_MAX)
+		? d->param_count : MRE_PARAM_MAX;
+	for (i = 0; i < pi->param_cap; i++) {
+		mre_param_capture(&pi->params[i], &d->param_bind[i]);
+	}
+
+	/* sql_full: replace each '?' with the captured literal.  Best-effort
+	 * textual substitution: '?' inside quoted strings/comments is not
+	 * recognized (the server, not the text, defines placeholders); more
+	 * '?' than captured params -> the tail stays as '?'. */
+	for (j = 0; j < sql_len && o + 1 < sizeof(pi->sql_full); j++) {
+		if (sql[j] != '?' || p >= pi->param_cap) {
+			pi->sql_full[o++] = sql[j];
+			continue;
+		}
+		mre_param_sql_literal(&pi->params[p], lit, sizeof(lit));
+		p++;
+		lit_len = strlen(lit);
+		if (o + lit_len >= sizeof(pi->sql_full)) {
+			break; /* out of room: sql_full stays truncated */
+		}
+		memcpy(pi->sql_full + o, lit, lit_len);
+		o += lit_len;
+	}
+	pi->sql_full[o] = '\0';
+	pi->has_sql_full = (zend_bool)1;
+}
+
+/* move a captured bind state into the log extra (before writing)       */
+static void mre_extra_set_prepared(mre_extra *e, const mre_prepared_info *pi)
+{
+	if (!pi->has_prepared) {
+		return;
+	}
+	e->has_prepared = (zend_bool)1;
+	e->param_total = pi->param_total;
+	e->param_cap = pi->param_cap;
+	memcpy(e->params, pi->params, sizeof(mre_param) * pi->param_cap);
+	e->has_sql_full = pi->has_sql_full;
+	memcpy(e->sql_full, pi->sql_full, sizeof(e->sql_full));
 }
 
 /* ------------------------------------------------------------------ */
@@ -429,6 +656,8 @@ static enum_func_status mre_hook_query(MYSQLND_CONN_DATA * conn,
 			mre_extra e;
 
 			mre_extra_conn(&e, conn);
+			e.has_cmd = (zend_bool)1;
+			mre_copy_str(e.cmd, sizeof(e.cmd), "query", 5);
 			mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, query,
 				MIN(query_len, (size_t)(MRE_MAX_SQL_LOG - 1)), &e);
 
@@ -447,6 +676,8 @@ static enum_func_status mre_hook_query(MYSQLND_CONN_DATA * conn,
 		mre_extra e;
 
 		mre_extra_conn(&e, conn);
+		e.has_cmd = (zend_bool)1;
+		mre_copy_str(e.cmd, sizeof(e.cmd), "query", 5);
 		mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, query,
 			MIN(query_len, (size_t)(MRE_MAX_SQL_LOG - 1)), &e);
 
@@ -569,6 +800,8 @@ static enum_func_status mre_hook_stmt_prepare(MYSQLND_STMT * const stmt,
 		mre_extra_conn(&e, d->conn);
 		e.has_stmt = (zend_bool)1;
 		e.stmt_id = d->stmt_id;
+		e.has_cmd = (zend_bool)1;
+		mre_copy_str(e.cmd, sizeof(e.cmd), "prepare", 7);
 		mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, query,
 			MIN(query_len, (size_t)(MRE_MAX_SQL_LOG - 1)), &e);
 
@@ -626,6 +859,8 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 	MYSQLND_STMT_DATA *d;
 	MYSQLND_CONN_DATA *conn;
 	mre_mysql_ctx *ctx;
+	mre_prepared_info pi;
+	zend_bool have_pi = (zend_bool)0;
 	int qkind = MRE_GTX_Q_NONE;
 	zend_bool gtx_on = mre_gtx_enabled();
 
@@ -646,6 +881,8 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 				mre_extra_conn(&e, conn);
 				e.has_stmt = (zend_bool)1;
 				e.stmt_id = d->stmt_id;
+				e.has_cmd = (zend_bool)1;
+				mre_copy_str(e.cmd, sizeof(e.cmd), "query", 5);
 				mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, "COMMIT",
 					sizeof("COMMIT") - 1, &e);
 
@@ -660,6 +897,13 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 			}
 			return PASS;
 		}
+		/* bind values must be read BEFORE the original execute touches
+		 * the statement - they are exactly what is about to be sent */
+		if (mre_mysql_enabled()) {
+			mre_prepared_capture(&pi, d, ctx ? ctx->sql : "",
+				ctx ? ctx->sql_len : 0);
+			have_pi = (zend_bool)1;
+		}
 	} else {
 		d = NULL;
 		conn = NULL;
@@ -673,15 +917,24 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 		MYSQLND_CONN_DATA *conn = d->conn;
 		mre_mysql_ctx *ctx = conn ? mre_ctx_get(conn) : NULL;
 		mre_extra e;
-		char content[MRE_MAX_SQL_LOG + 16];
+		const char *content;
 		size_t clen = 0;
 		const char *resp_word;
 		size_t resp_len;
 
-		mre_stmt_content(content, sizeof(content), &clen, ctx);
+		/* pure SQL only: the prepare-time statement itself, no prefix.
+		 * The "this is an execute" information lives in extra.cmd. */
+		content = ctx ? ctx->sql : "";
+		clen = ctx ? ctx->sql_len : 0;
+
 		mre_extra_conn(&e, conn);
 		e.has_stmt = (zend_bool)1;
 		e.stmt_id = d->stmt_id;
+		e.has_cmd = (zend_bool)1;
+		mre_copy_str(e.cmd, sizeof(e.cmd), "execute", 7);
+		if (have_pi) {
+			mre_extra_set_prepared(&e, &pi);
+		}
 		mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, content, clen, &e);
 
 		/* enable row sampling on the statement result set */

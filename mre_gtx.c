@@ -649,6 +649,8 @@ static void mre_gtx_finalize_conn(MYSQLND_CONN_DATA *conn, mre_gtx_ctx *gx,
 		}
 		e.has_port = (zend_bool)1;
 		e.port = (int)conn->port;
+		e.has_cmd = (zend_bool)1;
+		mre_copy_str(e.cmd, sizeof(e.cmd), "query", 5);
 		mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, sql, strlen(sql), &e);
 
 		mre_extra_init(&e);

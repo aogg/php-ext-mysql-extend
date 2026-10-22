@@ -86,23 +86,36 @@ docker run \
 JSON lines（默认），字段：`time`（ISO8601 本地时区）、`pid`、`request_id`（请求级唯一标识，见下）、`type`（`mysql|redis`）、`dir`（`req|resp`）、`content`、`extra`（行数/错误等，可能为 `null`）：
 
 ```json
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT id, name, age FROM users ORDER BY id","extra":{"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT id, name, age FROM users ORDER BY id","extra":{"cmd":"query","host":"127.0.0.1","port":3306}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"result","extra":{"rows":4,"fields":3,"host":"127.0.0.1","port":3306}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"1|alice|30","extra":{"rows":4,"fetched_rows":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"INSERT INTO users (name, age) VALUES ('dave', 22)","extra":{"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"INSERT INTO users (name, age) VALUES ('dave', 22)","extra":{"cmd":"query","host":"127.0.0.1","port":3306}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"OK","extra":{"affected_rows":1,"host":"127.0.0.1","port":3306}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"ERROR","extra":{"error_code":1146,"error":"Table 'db.t' doesn't exist","sqlstate":"42S02","host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ?","extra":{"stmt_id":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"EXECUTE SELECT name FROM users WHERE age > ?","extra":{"stmt_id":1,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ?","extra":{"cmd":"prepare","stmt_id":1,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ? AND name = ?","extra":{"cmd":"execute","stmt_id":1,"host":"127.0.0.1","port":3306,"prepared":{"sql":"SELECT name FROM users WHERE age > ? AND name = ?","params":[18,"bob"]},"sql_full":"SELECT name FROM users WHERE age > 18 AND name = 'bob'"}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"req","content":"SET k1 v1","extra":{"host":"127.0.0.1","port":6379}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"resp","content":"+OK","extra":{"port":6379}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"resp","content":"$3000:xxx…","extra":{"port":6379,"truncated":true}}
 ```
 
-text 格式（`mre.log_format=text`）：
+### content 恒为纯 SQL，执行动作看 extra.cmd
+
+mysql 的 **`dir=req` 记录 `content` 恒为纯 SQL 文本，永不加前缀**。历史版本会在预处理执行行拼 `"EXECUTE <SQL>"` 前缀，导致按首关键字分类的路由把 `EXECUTE SELECT` 误归写日志——现在该信息迁移到结构化字段：
+
+- `extra.cmd`：每条 mysql `dir=req` 记录必带，取值 `query`（COM_QUERY 普通/事务控制语句）/ `prepare`（预处理准备）/ `execute`（预处理执行）。gtx 收尾与延迟 COMMIT 场景实际发送的是裸 `ROLLBACK`/`COMMIT` 语句，记 `cmd=query`。`dir=resp` 记录不带 `cmd`。
+- `extra.prepared`：仅 execute 且**存在绑定参数**时出现，为对象 `{"sql": "<同 content 的 ? SQL>", "params": [...]}`。`params` 按绑定类型渲染：整型→JSON 数字、浮点→JSON 数字、字符串→JSON 字符串原文、NULL→`null`、blob→`"0x<hex截断>…(N bytes)"`。超过 32 个参数只记前 32 个，并在 `prepared.truncated=true` 标记（单个值超 256 字节尾部截断为 `…(N)`）。
+- `extra.sql_full`：仅 execute 且存在绑定参数时出现，为把 `?` 依次替换成字面量后的完整 SQL 文本（字符串字面量单引号包裹、内部 `'` 转义成 `''`；**不做反斜杠转义**——在 `NO_BACKSLASH_ESCAPES` 模式下可原样重放，其它 sql_mode 下含 `\` 的字符串字面量会差一个字节）。总长沿用 4096 字节截断。
+- execute 时没有绑定参数（`param_count=0` 或取不到）则**省略** `prepared` 与 `sql_full` 两字段，`cmd` 仍为 `execute`。
+- `content` 本身始终是那条 `?` SQL（三件套之外的"纯 SQL"主字段）。
+
+> 类型忠实度说明：绑定值按 mysqlnd 记录的声明类型（`MYSQLND_STMT_DATA.param_bind[i].type`）渲染——`i`→整型、`d`→浮点、`s`→字符串、`b`→blob 十六进制摘要、NULL→`null`；声明类型与变量实际类型不一致时按声明类型做与 mysqlnd 相同的数值转换（如 `'i'` 绑定字符串 `"5"` 渲染为 `5`）。
+
+text 格式（`mre.log_format=text`），新字段以 `cmd=` / `params=` / `sql_full=` 追加：
 
 ```
 2026-10-21T12:18:44+08:00 pid=130769 request_id=130769-3 type=redis dir=req content="PING" host=127.0.0.1 port=16379
+2026-10-21T12:18:45+08:00 pid=130769 request_id=130769-4 type=mysql dir=req content="SELECT name FROM users WHERE age > ? AND name = ?" cmd=execute stmt_id=1 host=127.0.0.1 port=3306 params=[18,"bob"] sql_full="SELECT name FROM users WHERE age > 18 AND name = 'bob'"
 ```
 
 ### request_id（请求级唯一标识）
@@ -113,7 +126,7 @@ fpm 下同一个 worker 进程（同一个 `pid`）会**串行处理多个请求
 - 同一请求的所有日志行 `request_id` 相同，不同请求不同——json 与 text 两种格式都带该字段，`pid` 字段保持不变。
 - 该标识同时注入脚本回调的 `$context['request_id']`（见下文），路由脚本可用它把"自己写的辅助日志"与扩展日志对齐。
 
-截断策略：SQL ≤ 4096 字节；redis 命令 ≤ 2048 字节（单参数 ≤ 256）；redis 响应摘要 ≤ 512 字节；采样行 ≤ 512 字节（16 列、单列 ≤ 64）。超限置 `extra.truncated=true`。
+截断策略：SQL ≤ 4096 字节；绑定参数单个值 ≤ 256 字节（超出尾部加 `…(N)`，N 为原始字节数）、最多记 32 个（超出置 `prepared.truncated=true`，params 片段整体 ≤ 2048 字节同样触发）；blob 参数记 `0x` + 前 32 字节 hex + `…(N bytes)`；redis 命令 ≤ 2048 字节（单参数 ≤ 256）；redis 响应摘要 ≤ 512 字节；采样行 ≤ 512 字节（16 列、单列 ≤ 64）。超限置 `extra.truncated=true`（redis/采样行）或 `prepared.truncated=true`（绑定参数）。
 
 ## 日志路由（阶段B）
 
@@ -163,7 +176,7 @@ return null;                              // null/空/非字符串 -> 降级到 
 | `type` | `mysql` 或 `redis` |
 | `dir` | `req` 或 `resp` |
 | `content` | SQL 或 redis 命令/响应文本 |
-| `extra` | 行数/错误信息数组（`affected_rows`/`rows`/`fetched_rows`/`fields`/`stmt_id`/`error_code`/`error`/`sqlstate`/`host`/`port`/`truncated`，仅含存在项） |
+| `extra` | 行数/错误信息数组（`cmd`（mysql req 专有：`query`/`prepare`/`execute`）/`affected_rows`/`rows`/`fetched_rows`/`fields`/`stmt_id`/`error_code`/`error`/`sqlstate`/`host`/`port`/`truncated`/`prepared`（execute 且有绑定参数时：`sql` 同 content、`params` 数组、超 32 个时 `truncated=true`）/`sql_full`（execute 且有绑定参数时：`?` 替换为字面量后的 SQL），仅含存在项） |
 | `headers` | 当前 HTTP 请求全部 header（由 `$_SERVER` 的 `HTTP_*` 与 `CONTENT_TYPE`/`CONTENT_LENGTH` 整理成 `小写名 => 值`，如 `x-foo-bar`；CLI 下为 `[]`） |
 | `post` | `$_POST` 原样 |
 | `cookie` | `$_COOKIE` 原样 |
@@ -199,7 +212,7 @@ mre.log_script = "/opt/mre/scripts/mre_log_router.php"
 3. **容器路径映射（/app/cache → /app/origin）**：若项目根位于容器内 `/app/cache/` 前缀下，且把前缀换成 `/app/origin/` 后对应目录存在，则日志落到 `/app/origin/...`——宿主机把 `/code/www`（即 Windows `D:\code\www`）挂载到容器 `/app/origin`，这样日志直接落到宿主机项目目录，无需进容器取日志；映射目标不存在则维持 `/app/cache/...` 原路径。
 4. **文件命名** = `<url路径>.query.log` / `<url路径>.write.log` / `<url路径>.redis.log`（`url路径` 为 base，文件都在 `runtime/mre-logs/` 下）：
    - base 取 `$_SERVER['REQUEST_URI']` 的 path 部分（去掉 `?`/`#` 之后）→ `rawurldecode` → 安全化：字母数字与 `._-` 保留、其余转 `-`，去首尾 `-`/`.`，截断到 100 字符；不压缩连续 `-`（尽量保持不同路径 → 不同文件）；CLI 或无 `REQUEST_URI` 用 `cli`；有 URI 但安全化后为空（如 `/`）用 `root`。例：`/api/user/list?a=1` → `api-user-list`。
-   - mysql 请求（`dir=req`）：SQL 去前导空白与注释（`--` 行 / `#` 行 / `/*...*/` 块）后，首关键字为 `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN`（大小写不敏感）→ `.query.log`；其余 mysql 语句 → `.write.log`（含 `EXECUTE SELECT ...` 这类预处理执行行，按首关键字判定）。
+   - mysql 请求（`dir=req`）：SQL 去前导空白与注释（`--` 行 / `#` 行 / `/*...*/` 块）后，首关键字为 `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN`（大小写不敏感）→ `.query.log`；其余 mysql 语句 → `.write.log`。预处理执行行（execute）的 `content` 自 0.1.x 起恒为纯 SQL（无 `EXECUTE ` 前缀），因此 `EXECUTE SELECT` 天然按首关键字归 `.query.log`，无需脚本做任何特判——**自带路由脚本对该结构变化零改动**；需要更细区分时可在脚本内读 `$context['extra']['cmd']`（`query`/`prepare`/`execute`）。
    - mysql 响应（`dir=resp`）：路由脚本每条记录独立执行、无跨记录状态，拿不到"响应对应的语句"，按 `extra` 元信息归类——含 `rows`/`fields`/`fetched_rows`（查询结果侧）→ `.query.log`，其余（`affected_rows`/`OK`/`ERROR` 等）→ `.write.log`（SELECT 失败的 ERROR 行会落在 `.write.log`，属已知取舍）。
    - redis 记录 → `.redis.log`；其他类型 → 返回 `null` 降级。
 5. **防御性**：不输出、不抛异常、不定义顶层具名函数/类（同进程每条记录重复 include，避免 `Cannot redeclare`）、不使用 `___mre_` 前缀变量、除 `$context` 外不产生全局变量（扩展侧另有 ob 捕获 + try/catch 包装兜底）。
@@ -250,6 +263,7 @@ mre.log_script = "/opt/mre/scripts/mre_log_router.php"
 
 MySQL（mysqlnd 层）：
 - 覆盖 mysqli / PDO_MYSQL 的普通查询、预处理语句（prepare/execute/get_result/**bind_result+fetch**）、多语句 `next_result`、缓冲与非缓冲结果。
+- 绑定参数捕获（`extra.cmd`/`extra.prepared`/`extra.sql_full`）：值取自 mysqlnd `MYSQLND_STMT_DATA.param_bind[i]`（`zv` + 声明类型 `type`），在原始 execute 发包前读取，mysqli `bind_param('isdb')` 与 PDO `bindValue/bindParam` 两条路径都覆盖。局限：字符串字面量只做 `''` 转义不做反斜杠转义（见上文）；SQL 文本里的 `?` 依次替换，**引号字符串/注释内的 `?` 不识别**（服务端才是占位符定义方）；blob 只记 hex 截断摘要，超限 sql_full 不可原样重放。
 - 行内容采样：mysqli 全覆盖——`get_result` 与 `bind_result+fetch` 两条取行路径都采样（后者经 mysqlnd stmt `fetch` 钩子读取绑定变量，采样行不带 `rows` 总数元信息）；PDO 在 PHP 8.1+ 通过 `fetch_row` 包装覆盖，7.4/8.0 的 PDO 取行走 C 数组路径，仅记录元信息（SQL/行数/错误不受影响）。
 - 异步查询（`send_query/reap_query` 直用）未挂钩。
 
