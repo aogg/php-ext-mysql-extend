@@ -53,7 +53,10 @@ var_dump($route($mk("INSERT INTO t VALUES (1)"), '/a') === "$logDir/a.write.log"
 var_dump($route($mk('SET NAMES utf8mb4'), '/a') === "$logDir/a.write.log");
 var_dump($route($mk('SHOW TABLES'), '/a') === "$logDir/a.query.log");
 var_dump($route($mk("-- hint\n/* block */\n  SELECT 1"), '/a') === "$logDir/a.query.log"); // comments stripped
-var_dump($route($mk('EXECUTE SELECT x FROM t'), '/a') === "$logDir/a.write.log"); // first keyword = EXECUTE
+// execute rows: content is pure SQL (no "EXECUTE " prefix) since the
+// cmd/prepared rework, so SELECT heads straight to .query.log; extra.cmd
+// carries the action and is not part of the routing decision
+var_dump($route($mk('SELECT x FROM t', 'req', ['cmd' => 'execute', 'stmt_id' => 1]), '/a') === "$logDir/a.query.log");
 
 // resp classification: result-set meta -> query; write meta -> write
 var_dump($route($mk('result', 'resp', ['rows' => 3, 'fields' => 2]), '/a') === "$logDir/a.query.log");

@@ -35,7 +35,7 @@ db() { docker exec "$MYSQLC" mysql $MYSQLARGS -e "$1" 2>/dev/null; }
 s1() {
   dexec "$CONTAINER" mkdir -p $LOGS; dexec "$CONTAINER" rm -f $LOGS/s1.json
   run_php $LOGS/s1.json -e MRE_SAMPLE_ROWS=1 /tmp/mre-test/scripts/t01_basic.php; echo "t01_exit=$?"
-  check $LOGS/s1.json '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"min_counts":{"mysql_req":10,"mysql_resp":10,"redis_req":4,"redis_resp":4},"must_contain":["affected_rows","error_code","fetched_rows","INSERT INTO users","EXECUTE SELECT name, age","table_not_exist_xyz","no_such_table_pdo","SET mre:s1:key","START TRANSACTION","COMMIT","ROLLBACK","\"type\":\"mysql\"","\"type\":\"redis\""],"fetched_rows_gte":2}'
+  check $LOGS/s1.json '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"min_counts":{"mysql_req":10,"mysql_resp":10,"redis_req":4,"redis_resp":4},"must_contain":["affected_rows","error_code","fetched_rows","INSERT INTO users","SELECT name, age FROM users WHERE id > ?","\"cmd\":\"query\"","\"cmd\":\"prepare\"","\"cmd\":\"execute\"","\"prepared\":{\"sql\":\"SELECT name, age FROM users WHERE id > ?\",\"params\":[0]}","\"sql_full\":\"SELECT name, age FROM users WHERE id > 0\"","table_not_exist_xyz","no_such_table_pdo","SET mre:s1:key","START TRANSACTION","COMMIT","ROLLBACK","\"type\":\"mysql\"","\"type\":\"redis\""],"fetched_rows_gte":2}'
 }
 
 s2() {
