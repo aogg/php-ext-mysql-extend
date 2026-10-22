@@ -13,6 +13,8 @@
 //   must_not_contain: [substr, ...]
 //   fetched_rows_eq : exact number of lines whose extra.fetched_rows is set
 //   fetched_rows_gte: at least N such lines
+//   warn_eq         : exact number of lines with type == "warn"
+//   warn_gte        : at least N such lines
 $file = isset($argv[1]) ? $argv[1] : '';
 $expect = json_decode(isset($argv[2]) ? $argv[2] : '{}', true);
 if (!is_array($expect)) { $expect = array(); }
@@ -40,7 +42,7 @@ if ($raw !== '') {
 
 if (($exists || $raw !== '') && (!empty($expect['valid_json']) || (isset($expect['min_counts']) && empty($expect['text_format'])) || (isset($expect['count_eq']) && empty($expect['text_format'])) || isset($expect['fetched_rows_eq']) || isset($expect['fetched_rows_gte']))) {
     $counts = array('mysql_req' => 0, 'mysql_resp' => 0, 'redis_req' => 0, 'redis_resp' => 0, 'warn' => 0, 'other' => 0);
-    $fetched = 0; $nb = 0;
+    $fetched = 0; $nb = 0; $warns = 0;
     $text_mode = !empty($expect['text_format']);
     foreach ($lines as $i => $line) {
         if ($text_mode) {
@@ -60,6 +62,7 @@ if (($exists || $raw !== '') && (!empty($expect['valid_json']) || (isset($expect
         $k = $j['type'] . '_' . $j['dir'];
         if (array_key_exists($k, $counts)) { $counts[$k]++; } else { $counts['other']++; }
         if (isset($j['extra']) && is_array($j['extra']) && array_key_exists('fetched_rows', $j['extra'])) { $fetched++; }
+        if ($j['type'] === 'warn') { $warns++; }
     }
     if ($nb) { $fail[] = "bad-json-total=$nb"; }
     foreach ((isset($expect['min_counts']) ? $expect['min_counts'] : array()) as $k => $v) {
@@ -75,6 +78,12 @@ if (($exists || $raw !== '') && (!empty($expect['valid_json']) || (isset($expect
     }
     if (isset($expect['fetched_rows_gte']) && $fetched < (int)$expect['fetched_rows_gte']) {
         $fail[] = "fetched_lines=$fetched<" . $expect['fetched_rows_gte'];
+    }
+    if (isset($expect['warn_eq']) && $warns !== (int)$expect['warn_eq']) {
+        $fail[] = "warn_lines=$warns!=" . $expect['warn_eq'];
+    }
+    if (isset($expect['warn_gte']) && $warns < (int)$expect['warn_gte']) {
+        $fail[] = "warn_lines=$warns<" . $expect['warn_gte'];
     }
 }
 

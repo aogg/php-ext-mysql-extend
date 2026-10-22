@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # mre 容器实测矩阵驱动（在有 docker CLI 的宿主机上运行）
-# 用法: CONTAINER=7.4-alpine-php-dev bash run-matrix.sh <s1|s2|...|s10|probe|repro|all>
+# 用法: CONTAINER=7.4-alpine-php-dev [EXT=/path/mre.so] bash run-matrix.sh <s1|...|s10|probe|repro|repro5|t14|all>
 # 前置: 容器内已部署 /tmp/mre-test/{src,scripts}，mysql8 已建 mre_test 库表（见 README.md）
 set -u
 CONTAINER="${CONTAINER:-7.4-alpine-php-dev}"
-EXT=/tmp/mre-test/src/modules/mre.so
+EXT="${EXT:-/tmp/mre-test/src/modules/mre.so}"
 SC="${1:-all}"
 LOGS=/tmp/mre-test/logs
 SDIR=/tmp/mre-test/gtxstate
@@ -144,13 +144,48 @@ repro() {
   local log=$LOGS/repro-t12.json
   dexec "$CONTAINER" rm -f "$log"
   dexec -e MRE_ENABLE=1 -e MRE_LOG_FILE="$log" -e MRE_LOG_SCRIPT=/tmp/mre-test/scripts/cb_t12.php "$CONTAINER" \
-    php -d extension="$EXT" /tmp/mre-test/scripts/t12_crashrepro.php 2>&1
+    php -d extension="$EXT" -d xdebug.mode=off /tmp/mre-test/scripts/t12_crashrepro.php 2>&1
   echo "repro_exit=$?  (BUG-2: 7.4 预期 139 SIGSEGV；8.1+ 预期 0 且日志有 type:warn)"
 }
 
+repro5() { # BUG-2 关单口径：crash 复现连跑 5 次，每次 exit=0 且行为断言
+  local i log out ec
+  for i in 1 2 3 4 5; do
+    log=$LOGS/repro5-$i.json
+    dexec "$CONTAINER" rm -f "$log"
+    out=$(dexec -e MRE_ENABLE=1 -e MRE_LOG_FILE="$log" -e MRE_LOG_SCRIPT=/tmp/mre-test/scripts/cb_t12.php "$CONTAINER" \
+      php -d extension="$EXT" -d xdebug.mode=off /tmp/mre-test/scripts/t12_crashrepro.php 2>&1); ec=$?
+    echo "run${i}_stdout: $(printf '%s' "$out" | tr '\n' '|')"
+    echo "run${i}_exit=$ec"
+    # 每次行为断言：BOOM 记录降级主日志、warn 恰一次含消息摘要、后续 after 记录继续落盘
+    check "$log" '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"warn_eq":1,"must_contain":["SET mre:t12:BOOM","t12 boom","SET mre:t12:after"]}'
+  done
+}
+
+t14() { t14run /tmp/mre-test/logs/t14; }
+t14run() { # Q3 脚本回调扩展面：抛异常/ParseError/return123/return null/正常路由
+  local BASE="$1" SC cb
+  dexec "$CONTAINER" mkdir -p "$BASE"
+  dexec "$CONTAINER" sh -c 'rm -f "$0"/rte.main.log "$0"/parse.main.log "$0"/ret123.main.log "$0"/retnull.main.log "$0"/ok.main.log "$0"/ok-route.log' "$BASE"
+  for SC in rte parse ret123 retnull ok; do
+    cb=/tmp/mre-test/scripts/cb_t14.php
+    [ "$SC" = parse ] && cb=/tmp/mre-test/scripts/cb_t14_parse.php
+    dexec -e MRE_ENABLE=1 -e MRE_LOG_FILE="$BASE/$SC.main.log" -e MRE_LOG_SCRIPT="$cb" "$CONTAINER" \
+      php -d extension="$EXT" -d xdebug.mode=off /tmp/mre-test/scripts/t14_script_edge.php "$SC"; echo "t14-$SC-exit=$?"
+  done
+  echo '--- assertions ---'
+  check "$BASE/rte.main.log"    '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"warn_eq":1,"must_contain":["SET mre:t14:rte","t14 rte exploded","mre:t14:rte:",":after"]}'
+  check "$BASE/parse.main.log"  '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"warn_eq":1,"must_contain":["SET mre:t14:parse","syntax error",":after"]}'
+  check "$BASE/ret123.main.log" '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"warn_eq":0,"must_not_contain":["\"type\":\"warn\""],"must_contain":["SET mre:t14:ret123",":after"]}'
+  check "$BASE/retnull.main.log" '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"warn_eq":0,"must_not_contain":["\"type\":\"warn\""],"must_contain":["SET mre:t14:retnull",":after"]}'
+  check "$BASE/ok-route.log"    '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"warn_eq":0,"must_contain":["SET mre:t14:ok",":after"]}'
+  # ok 场景：带标记记录被路由走；不带标记的握手记录(CONNECT/+OK)按 null 降级回主日志
+  check "$BASE/ok.main.log"     '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"warn_eq":0,"must_not_contain":["mre:t14:ok","\"type\":\"warn\""],"must_contain":["CONNECT"]}'
+}
+
 case "$SC" in
-  s1|s2|s3|s4|s5|s6|s7|s8|s9|s10|probe|repro) "$SC" ;;
-  all) s1; s2; s3; s4; s5; s6; s7; s8; s9; probe; repro ;;
+  s1|s2|s3|s4|s5|s6|s7|s8|s9|s10|probe|repro|repro5|t14) "$SC" ;;
+  all) s1; s2; s3; s4; s5; s6; s7; s8; s9; probe; repro5; t14 ;;
   *) echo "unknown scenario: $SC"; exit 2 ;;
 esac
 echo "MATRIX[$SC@$CONTAINER] DONE"
