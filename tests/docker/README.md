@@ -79,6 +79,7 @@ CONTAINER=8.4-alpine-php-dev bash run-matrix.sh s10     # 8.4 复跑 S1/S4/S5
 | repro | BUG-2 最小复现（script 抛异常 → 7.4 SIGSEGV / 8.4 正常降级；2963935 修复后轮2 复测 7.4 仍 139，fee8b3d 改 PHP 层 try/catch 包装后见复测轮3） | t12_crashrepro.php + cb_t12.php |
 | repro5 | BUG-2 关单口径：crash 复现连跑 5 次，每次 exit=0 + 降级主日志 + warn 恰一次（含摘要）+ 后续记录继续（fee8b3d 起可用） | t12_crashrepro.php + cb_t12.php |
 | t14 | 脚本回调扩展面：抛 RuntimeException / 回调文件 ParseError / return 123 / return null / 正常返回路由 五场景（fee8b3d 起可用） | t14_script_edge.php + cb_t14.php + cb_t14_parse.php |
+| t15 | mre_log_router.php 容器路径映射：/app/cache→/app/origin 正向映射、origin 目标缺失维持原路径、真实 zuodian 项目映射（需 /app/cache 与 /app/origin 双前缀存在，部署时把 scripts/mre_log_router.php 一并拷到 /tmp/mre-test/scripts/） | t15_router_mapping.php |
 | inionly | BUG-3 复现/回归（纯 ini 部署，无 MRE_* env；7c19265 修复后 7.4 日志创建 + mre.gtx_timeout 原值生效） | t13_inionly.php |
 
 ini-only 用法（容器内直跑，不得带任何 `-e MRE_*`）：

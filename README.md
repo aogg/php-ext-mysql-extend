@@ -277,7 +277,7 @@ Redis（streams 层）：
 ├── mre_redis.c                 # tcp 传输工厂包装 + RESP 双向增量解析
 ├── scripts/mre_log_router.php  # 自带日志路由脚本（mre.log_script 指向它；按项目根 + URL 路径 + 查询/非查询分文件）
 ├── docs/设计.md                 # 架构设计、版本兼容、阶段B实现取舍
-├── tests/*.phpt                # 阶段A 2 条 + 阶段B 5 条 + 容器bug回归 2 条 + 脚本回调回归 2 条（ParseError/非字符串降级）
+├── tests/*.phpt                # 阶段A 2 条 + 阶段B 5 条 + 容器bug回归 2 条 + 脚本回调回归 2 条（ParseError/非字符串降级）+ request_id/路由脚本 3 条（012~014）
 └── .github/workflows/build.yml # 7.4~8.4 矩阵编译打包
 ```
 

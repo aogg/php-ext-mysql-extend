@@ -183,9 +183,15 @@ t14run() { # Q3 脚本回调扩展面：抛异常/ParseError/return123/return nu
   check "$BASE/ok.main.log"     '{"nonempty":1,"valid_json":1,"no_empty_lines":1,"warn_eq":0,"must_not_contain":["mre:t14:ok","\"type\":\"warn\""],"must_contain":["CONNECT"]}'
 }
 
+t15() { # R4: mre_log_router.php 的 /app/cache -> /app/origin 容器路径映射（需容器内两前缀目录真实存在）
+  dexec "$CONTAINER" php -d xdebug.mode=off /tmp/mre-test/scripts/t15_router_mapping.php \
+    /tmp/mre-test/scripts/mre_log_router.php
+  echo "t15_exit=$?"
+}
+
 case "$SC" in
-  s1|s2|s3|s4|s5|s6|s7|s8|s9|s10|probe|repro|repro5|t14) "$SC" ;;
-  all) s1; s2; s3; s4; s5; s6; s7; s8; s9; probe; repro5; t14 ;;
+  s1|s2|s3|s4|s5|s6|s7|s8|s9|s10|probe|repro|repro5|t14|t15) "$SC" ;;
+  all) s1; s2; s3; s4; s5; s6; s7; s8; s9; probe; repro5; t14; t15 ;;
   *) echo "unknown scenario: $SC"; exit 2 ;;
 esac
 echo "MATRIX[$SC@$CONTAINER] DONE"
