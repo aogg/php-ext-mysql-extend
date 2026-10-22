@@ -285,11 +285,10 @@ ZEND_BEGIN_MODULE_GLOBALS(mre)
 	time_t         rules_src_mtime;
 	const void    *rules_src_root;   /* yaml root pointer rules were built from */
 
-	/* log script cache (mre_script.c); per request, never freed by hand */
+	/* log script execution (mre_script.c): the script runs through a
+	 * PHP-level try/catch include wrapper per record; no op_array cache
+	 * is kept (include + opcache own script compilation) */
 	zend_bool      script_available;/* 1 between RINIT and RSHUTDOWN     */
-	void          *script_oparray;  /* compiled script op_array          */
-	time_t         script_mtime;    /* mtime of the compiled version     */
-	long           script_size;     /* size of the compiled version      */
 	zend_bool      script_warned;   /* one-time degradation warning      */
 	zend_bool      script_busy;     /* re-entrancy guard                 */
 

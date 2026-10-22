@@ -8,7 +8,7 @@
 
 兼容 PHP **7.4 与 8.0 ~ 8.4**（源码内用 `PHP_VERSION_ID` 宏分支处理 API 差异），无任何外部库依赖（YAML 为内置精简解析器，不链接 libyaml）。
 
-7.x/8.x 差异处理要点：mysqlnd `fetch_row` 钩子（8.1+ 才有 `zval**/bool` 原型）整段用版本宏守卫，7.4/8.0 裸 `make` 通过；ini 读取不走 `INI_STR()` 宏（7.x 宏对指针参数做 `sizeof`，会把长键名截断），改为按真实长度调用 `zend_ini_string_ex()`；`mre.log_script` 的异常清理在引擎“逃逸栈顶帧”状态下完成（详见 `mre_script_run` 注释），7.4 下脚本抛异常同样降级告警而不是段错误。
+7.x/8.x 差异处理要点：mysqlnd `fetch_row` 钩子（8.1+ 才有 `zval**/bool` 原型）整段用版本宏守卫，7.4/8.0 裸 `make` 通过；ini 读取不走 `INI_STR()` 宏（7.x 宏对指针参数做 `sizeof`，会把长键名截断），改为按真实长度调用 `zend_ini_string_ex()`；`mre.log_script` 用 **PHP 层 `try { include } catch (Throwable)` 包装串**执行（`zend_eval_stringl` 编译执行，7.4 与 8.x 签名差异仅 const 修饰，传 `char[]` 字面量零告警），脚本抛出的异常/解析错误在用户态被 catch、从不越过 op_array 边界进入 C 层，7.4 下脚本抛异常同样降级告警而不是段错误（容器实测 BUG-2 的根治方案）。
 
 > 阶段A（核心：env/ini 配置、mysqlnd 捕获、redis 嗅探、日志写入、GA 编译）与阶段B
 > （YAML 规则引擎、脚本回调日志路径、跨 fpm 全局事务）均已完成，见下文与 `docs/设计.md`。
@@ -134,7 +134,7 @@ default_log_file: /var/log/mre/default.log
 
 ### 脚本回调（`mre.log_script`）
 
-值为 PHP 脚本**绝对路径**。每条记录写日志前执行一次该脚本（不做跨请求缓存；脚本内容按 mtime+size 缓存编译结果，同一请求内同版本只编译一次）。脚本 `return '路径'` 即本条记录的目标日志文件：
+值为 PHP 脚本**绝对路径**。每条记录写日志前执行一次该脚本。实现为一段固定的 PHP 层包装串（`try { $___mre_ret = include $___mre_path; } catch (Throwable $___mre_e) { $___mre_ret = null; $___mre_warn = $___mre_e->getMessage(); }`）经 `zend_eval_stringl` 编译执行：脚本路径经全局符号表变量 `$___mre_path` 注入（路径不拼进包装串，杜绝引号注入）；包装串约 140 字节，每条记录编译执行一次（实测 ~2µs/条）；脚本本身的编译走引擎 `include` 标准路径，启用 opcache 时命中共享内存缓存，未启用 opcache 时每条记录重新读盘编译（取舍：旧实现按 (mtime,size) 每请求缓存脚本 op_array，现改为不缓存——opcache 部署（fpm 常态）无差异，且引擎代管 op_array 生命周期，不再有共享内存 op_array 被误销毁的风险类）。脚本 `return '路径'` 即本条记录的目标日志文件：
 
 ```php
 <?php
@@ -164,12 +164,13 @@ return null;                              // null/空/非字符串 -> 降级到 
 | `uri` | `$_SERVER['REQUEST_URI'] ?? ''` |
 | `method` | `$_SERVER['REQUEST_METHOD'] ?? ''` |
 
-`$_SERVER` 原样可读（扩展只读不写，其余超全局同样不被污染；脚本返回后注入的 `$context` 会被立即移除）。
+`$_SERVER` 原样可读（扩展只读不写，其余超全局同样不被污染；脚本返回后注入的 `$context` 与内部变量 `$___mre_path/$___mre_ret/$___mre_warn` 会被立即移除，脚本不应使用 `___mre_` 前缀的全局变量）。
 
 降级与防护：
-- 脚本返回 `null`/空串/非字符串，或抛异常/致命错误（含解析错误）：降级写 **规则路由结果或 `mre.log_file`**，并在主日志记一条一次性 `type:"warn"` 告警（含异常消息摘要）。脚本错误绝不会让 PHP 进程崩溃或请求失败。
-- 执行前后保存并恢复引擎异常状态与执行栈帧；脚本输出（echo）被捕获丢弃。
-- 局限：脚本内 `exit()/die()` 仍会按 PHP 语义终止当前请求（与 auto_prepend_file 同理）；脚本内发起的 SQL/redis 记录不会再递归调用脚本本身（防重入），而是直接走规则/主日志。
+- 脚本返回 `null`/空串/非字符串：静默降级写 **规则路由结果或 `mre.log_file`**，不告警。
+- 脚本抛异常/解析错误（`ParseError` 也是 `Throwable`，同样被包装串 catch）：降级写规则/主日志，并在主日志记一条一次性 `type:"warn"` 告警（含异常消息摘要）。异常在 PHP 层被捕获，从不进入 C 层引擎状态，脚本错误绝不会让 PHP 进程崩溃或请求失败。
+- 执行前后仅保存/恢复两样东西：调用方执行帧（`EG(current_execute_data)`，置 NULL 让脚本以顶层帧跑在全局符号表上，与引擎执行 {main} 同一机制）与调用方已挂起的异常指针；脚本输出（echo）被捕获丢弃。
+- 局限：脚本内 `exit()/die()` 会终止当前请求（7.4 走 bailout 立即终止；8.x 为优雅 unwind，请求在下一条用户态边界处终止、`exit` 状态码保留，期间的记录仍会落盘）；脚本内发起的 SQL/redis 记录不会再递归调用脚本本身（防重入），而是直接走规则/主日志。
 
 ### 优先级示例
 
@@ -238,12 +239,12 @@ Redis（streams 层）：
 ├── mre_log.c                   # 统一日志写入器（flock/句柄缓存/降级/路由接入）
 ├── mre_yaml.c                  # 内置精简 YAML 解析器（映射/序列/块标量/注释）
 ├── mre_rules.c                 # yaml 规则引擎（PCRE2 编译缓存 + 首中路由）
-├── mre_script.c                # 日志路径脚本回调（zend_compile_file 缓存 + 隔离执行）
+├── mre_script.c                # 日志路径脚本回调（php层 try/catch include 包装 + 全局符号表注入）
 ├── mre_gtx.c                   # 跨 fpm 全局事务（注册表 + flock + mysqlnd 入口检查）
 ├── mre_mysql.c                 # mysqlnd conn_data+stmt 方法表挂钩（含 gtx 拦截）
 ├── mre_redis.c                 # tcp 传输工厂包装 + RESP 双向增量解析
 ├── docs/设计.md                 # 架构设计、版本兼容、阶段B实现取舍
-├── tests/*.phpt                # 阶段A 2 条 + 阶段B 5 条 + 容器bug回归 2 条（ini 长键名/脚本异常降级）
+├── tests/*.phpt                # 阶段A 2 条 + 阶段B 5 条 + 容器bug回归 2 条 + 脚本回调回归 2 条（ParseError/非字符串降级）
 └── .github/workflows/build.yml # 7.4~8.4 矩阵编译打包
 ```
 

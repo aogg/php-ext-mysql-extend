@@ -8,32 +8,59 @@
   | returning null/false/a non-string degrades to the next resolver.     |
   |                                                                      |
   | Execution model (deliberate trade-off, see docs/设计.md §8):          |
-  |   - the script is compiled through the zend_compile_file() global    |
-  |     pointer, so opcache keeps serving its cached op_array            |
-  |   - compiled op_arrays are cached per request keyed by (mtime,size); |
-  |     the file is parsed once per request instead of once per record   |
-  |   - the op_array is deliberately NOT destroyed by us: opcache may    |
-  |     hand out its shared-memory copy, which must never be destroyed;  |
-  |     a non-opcache build keeps one request-local op_array per request |
-  |     which the memory manager reclaims at request end (bounded)       |
-  |   - execution runs with EG(current_execute_data)=NULL so the script  |
-  |     gets its own frame on the global symbol table; only $context is  |
-  |     injected there and removed right after the call - $_SERVER and   |
-  |     the other superglobals are never written                         |
-  |   - exceptions / parse errors are caught (EG(exception)), summarized |
-  |     into a one-time main-log warning and swallowed so a broken       |
-  |     script can never fail the request; a pending exception of the    |
-  |     interrupted code is restored afterwards                          |
+  |   - the script runs through a fixed PHP-level wrapper compiled per   |
+  |     record with zend_eval_stringl():                                 |
+  |       try { $___mre_ret = include $___mre_path; }                    |
+  |       catch (Throwable $___mre_e) { $___mre_ret = null;              |
+  |       $___mre_warn = $___mre_e->getMessage(); }                      |
+  |     a thrown exception (or an include ParseError) is therefore       |
+  |     caught inside userland and never crosses the op_array boundary   |
+  |     into C - this is the BUG-2 fix: the 7.4 crash happened on the    |
+  |     engine's unwind path for exceptions that escape a top-level      |
+  |     op_array executed from C, and no engine-internal exception       |
+  |     surgery (zend_clear_exception in escaped-frame state, a          |
+  |     getMessage() probe under a detached exception) can make that     |
+  |     path safe; this design simply makes the path unreachable        |
+  |   - the wrapper string is a constant that only references $___mre_*  |
+  |     variables - the script path itself is injected through the       |
+  |     global symbol table, never interpolated into the wrapper         |
+  |   - the script is compiled by the engine's own include machinery,    |
+  |     so opcache serves its shared-memory cache when enabled; without  |
+  |     opcache each record pays one script compile (accepted cost,      |
+  |     replaces the old per-request (mtime,size) op_array cache)        |
+  |   - execution runs with EG(current_execute_data)=NULL so the wrapper |
+  |     frame lands on the global symbol table; only $context/$___mre_*  |
+  |     are injected there and removed right after the call - $_SERVER   |
+  |     and the other superglobals are never written                     |
+  |   - a pending exception of the interrupted code is detached (plain   |
+  |     pointer save/restore, zend_execute() would silently skip         |
+  |     execution otherwise) and restored afterwards; wrapper results    |
+  |     are read back from $___mre_ret/$___mre_warn, and a failure is    |
+  |     summarized into a one-time main-log warning so a broken script   |
+  |     can never fail the request                                       |
   +----------------------------------------------------------------------+
 */
 
 #include "php_mre.h"
 #include "zend_API.h"
 #include "zend_exceptions.h"
-#include "zend_interfaces.h"
+#include "zend_objects_API.h"
 
 #include <string.h>
 #include <sys/stat.h>
+
+/*
+ * Fixed wrapper source.  Only $___mre_* variables are referenced - the
+ * script path arrives through the global symbol table ($___mre_path), so
+ * a path can never break out of the wrapper by quoting tricks.  Declared
+ * as non-const char[] on purpose: zend_eval_stringl() takes `char *str`
+ * under PHP 7.4 and `const char *str` since 8.0, a static char array is
+ * warning-free against both signatures.
+ */
+static char mre_wrapper_src[] =
+	"try { $___mre_ret = include $___mre_path; } "
+	"catch (Throwable $___mre_e) "
+	"{ $___mre_ret = null; $___mre_warn = $___mre_e->getMessage(); }";
 
 /* ------------------------------------------------------------------ */
 /* request lifecycle                                                    */
@@ -41,17 +68,15 @@
 void mre_script_rinit(void)
 {
 	MRE_G(script_available) = (zend_bool)1;
-	MRE_G(script_oparray) = NULL;
-	MRE_G(script_mtime) = 0;
-	MRE_G(script_size) = 0;
 	MRE_G(script_busy) = (zend_bool)0;
+	/* script_warned deliberately not reset: the degradation warning is
+	 * once per process, not once per request */
 }
 
 void mre_script_rshutdown(void)
 {
-	/* the compiled op_array (if any) is request memory: just forget it */
+	/* executing the log script after the executor shuts down is unsafe */
 	MRE_G(script_available) = (zend_bool)0;
-	MRE_G(script_oparray) = NULL;
 	MRE_G(script_busy) = (zend_bool)0;
 }
 
@@ -130,7 +155,10 @@ static void mre_ctx_headers(zval *out)
 	}
 }
 
-static void mre_ctx_copy_superglobal(const char *name, size_t name_len, zval *out)
+/* `name` is char* (not const) because PHP 7.4 declares
+ * zend_is_auto_global_str(char *, size_t); 8.x takes a const char *
+ * and accepts a char * argument just as well */
+static void mre_ctx_copy_superglobal(char *name, size_t name_len, zval *out)
 {
 	zval *gv;
 
@@ -277,31 +305,6 @@ static zend_bool mre_call_simple(const char *fn, size_t fn_len)
 	return (zend_bool)1;
 }
 
-/* current exception message summary ("" when none) */
-static void mre_exception_summary(char *buf, size_t cap)
-{
-	zval rv;
-	zend_object *ex = EG(exception);
-
-	buf[0] = '\0';
-	if (!ex) {
-		mre_copy_str(buf, cap, "unknown error", 13);
-		return;
-	}
-	/* zend_call_function refuses to run while an exception is pending:
-	 * detach it around the getMessage() call */
-	EG(exception) = NULL;
-	ZVAL_UNDEF(&rv);
-	if (zend_call_method_with_0_params(ex, ex->ce,
-			NULL, "getmessage", &rv) && Z_TYPE(rv) == IS_STRING) {
-		mre_copy_str(buf, cap, Z_STRVAL(rv), Z_STRLEN(rv));
-	} else {
-		mre_copy_str(buf, cap, "exception", 9);
-	}
-	zval_ptr_dtor(&rv);
-	EG(exception) = ex;
-}
-
 /* ------------------------------------------------------------------ */
 /* record context passed down to the builder                            */
 /* ------------------------------------------------------------------ */
@@ -350,134 +353,133 @@ static void mre_ctx_build(zval *ctx, const mre_script_ctxinfo *ci)
 }
 
 /* ------------------------------------------------------------------ */
-/* compile (cached per request by mtime+size) and execute               */
+/* execute the wrapper (which includes the script) and read results     */
 /* ------------------------------------------------------------------ */
-static zend_op_array *mre_script_compile(const char *path, time_t mtime,
-                                         long size, char *summary,
-                                         size_t summary_cap)
+/* the $___mre_* / $context slots we own in the global symbol table */
+static void mre_script_globals_cleanup(void)
 {
-	zend_op_array *op;
-	zend_file_handle fh;
-
-	if (MRE_G(script_oparray)
-			&& MRE_G(script_mtime) == mtime
-			&& MRE_G(script_size) == size) {
-		return (zend_op_array *)MRE_G(script_oparray); /* up to date */
-	}
-
-#if PHP_VERSION_ID >= 80000
-	zend_stream_init_filename(&fh, path);
-#else
-	memset(&fh, 0, sizeof(fh));
-	fh.type = ZEND_HANDLE_FILENAME;
-	fh.filename = (char *)path;
-	fh.opened_path = NULL;
-	fh.free_filename = 0;
-#endif
-
-	op = zend_compile_file(&fh, ZEND_INCLUDE);
-
-	if (!op) {
-		if (EG(exception)) {
-			mre_exception_summary(summary, summary_cap);
-			zend_clear_exception();
-		} else {
-			mre_copy_str(summary, summary_cap, "compilation failed", 19);
-		}
-		return NULL;
-	}
-
-	MRE_G(script_oparray) = op;
-	MRE_G(script_mtime) = mtime;
-	MRE_G(script_size) = size;
-	return op;
+	zend_hash_str_del(&EG(symbol_table), "context", 7);
+	zend_hash_str_del(&EG(symbol_table), "___mre_path", 11);
+	zend_hash_str_del(&EG(symbol_table), "___mre_ret", 10);
+	zend_hash_str_del(&EG(symbol_table), "___mre_warn", 11);
 }
 
-static zend_bool mre_script_run(const char *path, time_t mtime, long size,
-                                const mre_script_ctxinfo *ci, zval *retval)
+static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
+                                char *out, size_t cap)
 {
-	zend_op_array *op;
 	zend_execute_data *prev_ed;
 	zend_object *pending;
-	zval ctx;
-	zend_bool ok = (zend_bool)1;
-	char summary[256];
+	zval ctx, pathv, *ret, *warn;
+	zend_bool routed = (zend_bool)0;
 
 	/*
-	 * Run the callback the way the engine itself runs top-level code:
-	 * with EG(current_execute_data) == NULL, zend_execute() pushes a
-	 * ZEND_CALL_TOP_CODE frame whose symbol table is the global one, so
-	 * the callback sees $context in the globals exactly like {main} does.
+	 * The wrapper (a fixed one-liner, see mre_wrapper_src) does the whole
+	 * job in userland: include the script and catch anything it throws -
+	 * runtime exceptions and include ParseErrors alike are Throwable, so
+	 * no exception ever escapes the wrapper's op_array into C.  The 7.4
+	 * container crash (BUG-2) lived exactly on the escape path: an
+	 * uncaught exception leaving a top-level op_array executed from C
+	 * leaves EG(current_execute_data)=NULL, and clearing it there made
+	 * 7.4 write EG(opline_before_exception) (a pointer into the dead
+	 * script op_array) into the frame about to be resumed.  This design
+	 * never enters that state, so the old engine-internal repair attempts
+	 * are simply gone.
 	 *
-	 * The NULL frame is also the state the executor leaves behind when an
-	 * uncaught exception escapes that top frame (7.4 and 8.x alike), and
-	 * it must still be in effect while the exception is summarized and
-	 * cleared:
-	 *   - zend_call_function() takes its dedicated dummy-frame path for
-	 *     the getMessage() probe, instead of poking the interrupted frame
-	 *     (7.4 reads EG(current_execute_data)->opline->opcode there);
-	 *   - zend_clear_exception() skips its writeback of
-	 *     EG(opline_before_exception) - a pointer INTO the script's
-	 *     op_array - into EG(current_execute_data)->opline.
-	 *
-	 * The previous order restored the caller frame first and only then
-	 * cleared, so on 7.4 the writeback stamped that foreign opline into
-	 * the very frame the engine was about to resume (7.4 dereferences
-	 * ->opline of the current frame in zend_call_function's fake-frame
-	 * logic and zend_throw_exception_internal), taking the process down
-	 * with SIGSEGV as soon as a log script threw (container bug BUG-2;
-	 * 8.1+ hardened this unwind path and masked it).
+	 * Two pieces of engine state remain, both engine-sanctioned:
+	 *   - EG(current_execute_data)=NULL around the call: zend_execute()
+	 *     (zend_eval_stringl uses it internally) then pushes a
+	 *     ZEND_CALL_TOP_CODE frame bound to &EG(symbol_table), so the
+	 *     wrapper and the included script see $context/$___mre_* in the
+	 *     globals exactly like {main} does and never touch the frame of
+	 *     the interrupted code;
+	 *   - EG(exception) pointer save/restore: a pending exception of the
+	 *     interrupted code must not be visible to the wrapper (the
+	 *     engine would skip execution or route it into the catch), and
+	 *     must still be pending afterwards for whoever owned it.
 	 */
 	pending = EG(exception);
+	EG(exception) = NULL;
+
 	prev_ed = EG(current_execute_data);
 	EG(current_execute_data) = NULL;
 
-	zend_try {
-		op = mre_script_compile(path, mtime, size, summary, sizeof(summary));
-	} zend_catch {
-		EG(current_execute_data) = prev_ed;
-		zend_bailout();
-	} zend_end_try();
-	if (!op) {
-		EG(current_execute_data) = prev_ed;
-		mre_script_warn(path, summary);
-		return (zend_bool)0;
-	}
-
-	/* expose $context (and only it) in the global symbol table */
+	/* expose $context and the script path (and only those) in globals */
 	mre_ctx_build(&ctx, ci);
+	ZVAL_STRING(&pathv, path);
 	zend_hash_str_update(&EG(symbol_table), "context", 7, &ctx);
+	zend_hash_str_update(&EG(symbol_table), "___mre_path", 11, &pathv);
 
 	zend_try {
-		zend_execute(op, retval);
+		/* compile+execute+destroy per record; the wrapper is a constant
+		 * ~140-byte string (measured ~2us/record on 8.2), the script
+		 * itself is compiled by include and cached by opcache when on */
+		if (zend_eval_stringl(mre_wrapper_src, sizeof(mre_wrapper_src) - 1,
+				NULL, "mre log_script wrapper") == FAILURE) {
+			/* unreachable for our constant wrapper source; degrade with
+			 * a summary instead of touching engine exception state */
+			EG(current_execute_data) = prev_ed;
+			EG(exception) = pending;
+			mre_script_globals_cleanup();
+			mre_script_warn(path, "wrapper compile failed");
+			return (zend_bool)0;
+		}
 	} zend_catch {
-		/* exit()/fatal inside the callback: restore what we own, then
+		/* exit()/fatal inside the script: restore what we own, then
 		 * let the bailout unwind the request as the engine expects */
 		EG(current_execute_data) = prev_ed;
 		EG(exception) = pending;
-		zend_hash_str_del(&EG(symbol_table), "context", 7);
+		mre_script_globals_cleanup();
 		zend_bailout();
 	} zend_end_try();
 
-	if (EG(exception) && EG(exception) != pending) {
-		mre_exception_summary(summary, sizeof(summary));
-		zend_clear_exception();
-		ok = (zend_bool)0;
-	}
-
-	/* resume the interrupted frame only after our exception is gone */
+	/* the wrapper caught everything catchable (Throwable) - resume the
+	 * interrupted frame */
 	EG(current_execute_data) = prev_ed;
 
-	/* keep whatever exception the interrupted code had pending */
+#if PHP_VERSION_ID >= 80000
+	if (EG(exception) != NULL && EG(exception) != pending
+			&& (zend_is_unwind_exit(EG(exception))
+				|| zend_is_graceful_exit(EG(exception)))) {
+		/*
+		 * exit()/die() inside the script.  Since PHP 8.0 exit is not a
+		 * bailout but a special exception the VM unwinds gracefully; it
+		 * crosses the include/wrapper frames and surfaces here.  Leave it
+		 * pending so the engine finishes the unwind the script asked for
+		 * (the request ends with the requested exit status); degrade this
+		 * record silently - whatever the script returned is irrelevant.
+		 * The interrupted code's exception (if any) belonged to us while
+		 * detached and is superseded by the exit - release it.
+		 */
+		if (pending != NULL) {
+			zend_objects_store_del(pending);
+		}
+		mre_script_globals_cleanup();
+		return (zend_bool)0;
+	}
+#endif
+
+	/* nothing of ours can be pending here (Throwable was caught in the
+	 * wrapper); keep whatever exception the interrupted code had pending */
 	EG(exception) = pending;
 
-	/* drop $context again - do not leak it into userland */
-	zend_hash_str_del(&EG(symbol_table), "context", 7);
-
-	if (!ok) {
-		mre_script_warn(path, summary);
+	/* $___mre_warn: set by the wrapper's catch (message summary) */
+	warn = zend_hash_str_find(&EG(symbol_table), "___mre_warn", 11);
+	if (warn && Z_TYPE_P(warn) == IS_STRING && Z_STRLEN_P(warn) > 0) {
+		mre_script_warn(path, Z_STRVAL_P(warn));
 	}
-	return ok;
+
+	/* $___mre_ret: the include's return value (the requested log path) */
+	ret = zend_hash_str_find(&EG(symbol_table), "___mre_ret", 10);
+	if (ret && Z_TYPE_P(ret) == IS_STRING && Z_STRLEN_P(ret) > 0
+			&& (size_t)Z_STRLEN_P(ret) < cap) {
+		mre_copy_str(out, cap, Z_STRVAL_P(ret), Z_STRLEN_P(ret));
+		routed = (zend_bool)1;
+	}
+
+	/* drop our globals again - do not leak them into userland */
+	mre_script_globals_cleanup();
+
+	return routed;
 }
 
 /* ------------------------------------------------------------------ */
@@ -491,7 +493,6 @@ zend_bool mre_script_route(const char *type, const char *dir,
 	const mre_config *cfg;
 	struct stat st;
 	mre_script_ctxinfo ci;
-	zval retval;
 	zend_bool ob_on, ok;
 
 	if (!MRE_G(cfg_valid)) {
@@ -506,7 +507,8 @@ zend_bool mre_script_route(const char *type, const char *dir,
 		return (zend_bool)0;
 	}
 
-	/* stat once per record; the compile cache validates (mtime,size) */
+	/* stat once per record: a missing script warns once instead of
+	 * emitting an include E_WARNING (captured by ob) on every record */
 	if (stat(cfg->log_script, &st) != 0) {
 		mre_script_warn(cfg->log_script, "stat() failed");
 		return (zend_bool)0;
@@ -518,24 +520,13 @@ zend_bool mre_script_route(const char *type, const char *dir,
 	ci.content_len = content_len;
 	ci.extra = extra;
 
-	ZVAL_UNDEF(&retval);
-
 	MRE_G(script_busy) = (zend_bool)1;
 	ob_on = mre_call_simple("ob_start", 8);
-	ok = mre_script_run(cfg->log_script, (time_t)st.st_mtime,
-		(long)st.st_size, &ci, &retval);
+	ok = mre_script_run(cfg->log_script, &ci, out, cap);
 	if (ob_on) {
 		mre_call_simple("ob_end_clean", 12);
 	}
 	MRE_G(script_busy) = (zend_bool)0;
 
-	if (ok && Z_TYPE(retval) == IS_STRING && Z_STRLEN(retval) > 0
-			&& (size_t)Z_STRLEN(retval) < cap) {
-		mre_copy_str(out, cap, Z_STRVAL(retval), Z_STRLEN(retval));
-		zval_ptr_dtor(&retval);
-		return (zend_bool)1;
-	}
-
-	zval_ptr_dtor(&retval);
-	return (zend_bool)0;
+	return ok;
 }
