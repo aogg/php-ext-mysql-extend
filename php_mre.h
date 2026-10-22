@@ -54,6 +54,7 @@
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
 #define MRE_PATH_MAX        1024  /* config path values                */
+#define MRE_REQUEST_ID_MAX  64    /* "<pid>-<seq>", incl. NUL          */
 #define MRE_LOG_LINE_MAX    16384 /* one log line, stack allocated     */
 #define MRE_JSON_VAL_MAX    8192  /* escaped content cap inside a line */
 #define MRE_EXTRA_KV_MAX    12    /* max extra key/value pairs         */
@@ -263,12 +264,20 @@ void mre_copy_str(char *dst, size_t dst_cap,
                   const char *src, size_t src_len);    /* NUL-term copy  */
 void mre_makedirs(const char *path);                   /* mkdir -p       */
 
+/* request-level id "<pid>-<seq>": RINIT bumps a process-wide counter and
+ * re-renders it; get() lazily renders "<pid>-0" for lines written before
+ * the first request (e.g. MINIT-time warnings). Used by the log line
+ * formats and injected into the log_script $context.                  */
+void mre_request_id_next(void);       /* RINIT: bump + re-render */
+const char *mre_request_id_get(void); /* current id, never NULL */
+
 /* ------------------------------------------------------------------ */
 /* Module globals                                                      */
 /* ------------------------------------------------------------------ */
 ZEND_BEGIN_MODULE_GLOBALS(mre)
 	mre_config     cfg;              /* resolved in RINIT */
 	zend_bool      cfg_valid;
+	char           request_id[MRE_REQUEST_ID_MAX]; /* per-request "<pid>-<seq>" */
 	FILE          *log_fp;           /* cached append handle  */
 	char          *log_fp_path;      /* estrdup'd owner of cache */
 	zend_bool      log_open_warned; /* one-time fallback warning */

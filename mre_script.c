@@ -45,6 +45,7 @@
 #include "zend_API.h"
 #include "zend_exceptions.h"
 #include "zend_objects_API.h"
+#include "main/SAPI.h"    /* SG(request_info).path_translated */
 
 #include <string.h>
 #include <sys/stat.h>
@@ -227,6 +228,71 @@ static void mre_ctx_server_var(const char *key, zval *out)
 	}
 }
 
+/*
+ * Entry script of the current request, as an absolute path when the SAPI
+ * provides one (web SAPIs do).  Resolution order:
+ *   1. $_SERVER['SCRIPT_FILENAME']  - web SAPIs (fpm/apache/cgi/...)
+ *   2. get_included_files()[0]      - CLI / when (1) is missing or empty
+ *      (the first included file is always the main script; looked up in
+ *       the function table like session_id() - no compile-time deps)
+ *   3. SG(request_info).path_translated - what the SAPI itself knows
+ * Always succeeds; "" when nothing is known (e.g. `php -r` code).
+ */
+static void mre_ctx_entry_script(zval *out)
+{
+	zend_function *fn;
+	zval fname, rv, *v;
+
+	/* 1) $_SERVER['SCRIPT_FILENAME'] */
+	mre_ctx_server_var("SCRIPT_FILENAME", out);
+	if (Z_TYPE_P(out) == IS_STRING && Z_STRLEN_P(out) > 0) {
+		return;
+	}
+
+	/* 2) get_included_files()[0] */
+	fn = (zend_function *)zend_hash_str_find_ptr(EG(function_table),
+		"get_included_files", sizeof("get_included_files") - 1);
+	if (fn != NULL) {
+		zend_fcall_info fci;
+		zend_fcall_info_cache fcc;
+
+		memset(&fci, 0, sizeof(fci));
+		memset(&fcc, 0, sizeof(fcc));
+		ZVAL_UNDEF(&rv);
+		ZVAL_STRING(&fname, "get_included_files");
+		fci.size = sizeof(fci);
+		fci.function_name = fname;
+		fci.retval = &rv;
+		fci.param_count = 0;
+#if PHP_VERSION_ID >= 80000
+		fci.named_params = NULL;
+#else
+		fci.no_separation = 1;
+#endif
+		if (zend_call_function(&fci, &fcc) == SUCCESS && Z_TYPE(rv) == IS_ARRAY) {
+			v = zend_hash_index_find(Z_ARRVAL(rv), 0);
+			if (v != NULL && Z_TYPE_P(v) == IS_STRING && Z_STRLEN_P(v) > 0) {
+				zval_ptr_dtor(out); /* drop the "" placeholder */
+				ZVAL_COPY(out, v);
+			}
+		}
+		if (!Z_ISUNDEF(rv)) {
+			zval_ptr_dtor(&rv);
+		}
+		zval_ptr_dtor(&fname);
+		if (Z_TYPE_P(out) == IS_STRING && Z_STRLEN_P(out) > 0) {
+			return;
+		}
+	}
+
+	/* 3) SAPI's own idea of the executed script */
+	if (SG(request_info).path_translated != NULL
+			&& SG(request_info).path_translated[0] != '\0') {
+		zval_ptr_dtor(out);
+		ZVAL_STRING(out, SG(request_info).path_translated);
+	}
+}
+
 /* extra[]: row counts / error info for the script */
 static void mre_ctx_extra(const mre_extra *e, zval *out)
 {
@@ -350,6 +416,16 @@ static void mre_ctx_build(zval *ctx, const mre_script_ctxinfo *ci)
 
 	mre_ctx_server_var("REQUEST_METHOD", &tmp);
 	add_assoc_zval_ex(ctx, "method", sizeof("method") - 1, &tmp);
+
+	/* request identity - the same tag every log line of this request
+	 * carries (pid alone cannot identify a request under fpm) */
+	add_assoc_long_ex(ctx, "pid", sizeof("pid") - 1, (zend_long)getpid());
+	add_assoc_string_ex(ctx, "request_id", sizeof("request_id") - 1,
+		mre_request_id_get());
+
+	/* entry script path, so a router script can identify the project */
+	mre_ctx_entry_script(&tmp);
+	add_assoc_zval_ex(ctx, "script", sizeof("script") - 1, &tmp);
 }
 
 /* ------------------------------------------------------------------ */

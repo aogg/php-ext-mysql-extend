@@ -78,6 +78,51 @@ void mre_iso8601_now(char *buf, size_t cap)
 }
 
 /* ------------------------------------------------------------------ */
+/* mre_request_id: request-level unique id "<pid>-<seq>"                */
+/*                                                                      */
+/* Under fpm the same worker process (one pid) serves many requests     */
+/* serially, so pid alone cannot tell lines of one request apart from   */
+/* the next.  RINIT bumps a process-wide counter and re-renders the id, */
+/* so every line of one request carries the same tag and consecutive    */
+/* requests differ.  The counter is a plain file-scope variable (not a  */
+/* module global): under ZTS it is shared by all threads of the process */
+/* (bumped atomically where available), keeping pid+seq unique even     */
+/* when several threads serve requests concurrently.                    */
+/* The rendered snapshot lives in the module globals (thread-local      */
+/* under ZTS); log lines read it without any locking - it is only       */
+/* written once per request start, never mid-request.                   */
+/* ------------------------------------------------------------------ */
+static zend_ulong mre_request_seq_shared = 0;
+
+static zend_ulong mre_request_seq_bump(void)
+{
+#if defined(PHP_WIN32)
+	return ++mre_request_seq_shared;
+#elif defined(__GNUC__) || defined(__clang__)
+	return (zend_ulong)__sync_add_and_fetch(&mre_request_seq_shared, (zend_ulong)1);
+#else
+	return ++mre_request_seq_shared;
+#endif
+}
+
+void mre_request_id_next(void)
+{
+	snprintf(MRE_G(request_id), sizeof(MRE_G(request_id)), "%ld-%lu",
+		(long)getpid(), (unsigned long)mre_request_seq_bump());
+}
+
+const char *mre_request_id_get(void)
+{
+	if (MRE_G(request_id)[0] == '\0') {
+		/* written before the first RINIT (MINIT-time warning etc.):
+		 * render a process-level fallback without burning a number */
+		snprintf(MRE_G(request_id), sizeof(MRE_G(request_id)), "%ld-0",
+			(long)getpid());
+	}
+	return MRE_G(request_id);
+}
+
+/* ------------------------------------------------------------------ */
 /* mre_makedirs: create all missing parent directories (mkdir -p)       */
 /* ------------------------------------------------------------------ */
 void mre_makedirs(const char *path)

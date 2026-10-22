@@ -112,6 +112,10 @@ PHP_MSHUTDOWN_FUNCTION(mre)
 
 PHP_RINIT_FUNCTION(mre)
 {
+	/* per-request unique id "<pid>-<seq>" for every log line and the
+	 * log_script $context (fpm: one pid serves many requests serially) */
+	mre_request_id_next();
+
 	/* env > ini every request (env may change between fpm requests) */
 	mre_config_refresh();
 

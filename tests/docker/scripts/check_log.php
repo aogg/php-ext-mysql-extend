@@ -89,7 +89,7 @@ if (($exists || $raw !== '') && (!empty($expect['valid_json']) || (isset($expect
 
 if (!empty($expect['text_format']) && $raw !== '') {
     foreach ($lines as $i => $line) {
-        if (!preg_match('/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:+\-]+ pid=[0-9]+ type=[a-z]+ dir=[a-z]+ content="/', $line)) {
+        if (!preg_match('/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:+\-]+ pid=[0-9]+ request_id=[0-9]+-[0-9]+ type=[a-z]+ dir=[a-z]+ content="/', $line)) {
             $fail[] = "bad-text-line-$i: " . substr($line, 0, 120);
             break;
         }

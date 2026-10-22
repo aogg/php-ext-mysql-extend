@@ -266,17 +266,19 @@ static void mre_log_emit_record(const char *target,
 		mre_json_escape(dir, dir ? strlen(dir) : 0, dirbuf, sizeof(dirbuf));
 		mre_json_escape(content, content_len, esc, sizeof(esc));
 
+		/* request_id is generated internally ("[0-9-]" only): no escape */
 		mre_lbuf_appendf(line, sizeof(line), &len,
-			"{\"time\":\"%s\",\"pid\":%d,\"type\":\"%s\",\"dir\":\"%s\",\"content\":\"%s\"",
-			tsbuf, (int)getpid(), typebuf, dirbuf, esc);
+			"{\"time\":\"%s\",\"pid\":%d,\"request_id\":\"%s\",\"type\":\"%s\",\"dir\":\"%s\",\"content\":\"%s\"",
+			tsbuf, (int)getpid(), mre_request_id_get(), typebuf, dirbuf, esc);
 		mre_lbuf_appendf(line, sizeof(line), &len, ",");
 		mre_log_extra_json(line, sizeof(line), &len, extra);
 		mre_lbuf_appendf(line, sizeof(line), &len, "}");
 	} else {
 		mre_json_escape(content, content_len, esc, sizeof(esc));
 		mre_lbuf_appendf(line, sizeof(line), &len,
-			"%s pid=%d type=%s dir=%s content=\"%s\"",
-			tsbuf, (int)getpid(), type ? type : "", dir ? dir : "", esc);
+			"%s pid=%d request_id=%s type=%s dir=%s content=\"%s\"",
+			tsbuf, (int)getpid(), mre_request_id_get(),
+			type ? type : "", dir ? dir : "", esc);
 		mre_log_extra_text(line, sizeof(line), &len, extra);
 	}
 

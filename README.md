@@ -83,27 +83,35 @@ docker run \
 
 ## 日志格式
 
-JSON lines（默认），字段：`time`（ISO8601 本地时区）、`pid`、`type`（`mysql|redis`）、`dir`（`req|resp`）、`content`、`extra`（行数/错误等，可能为 `null`）：
+JSON lines（默认），字段：`time`（ISO8601 本地时区）、`pid`、`request_id`（请求级唯一标识，见下）、`type`（`mysql|redis`）、`dir`（`req|resp`）、`content`、`extra`（行数/错误等，可能为 `null`）：
 
 ```json
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"mysql","dir":"req","content":"SELECT id, name, age FROM users ORDER BY id","extra":{"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"mysql","dir":"resp","content":"result","extra":{"rows":4,"fields":3,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"mysql","dir":"resp","content":"1|alice|30","extra":{"rows":4,"fetched_rows":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"mysql","dir":"req","content":"INSERT INTO users (name, age) VALUES ('dave', 22)","extra":{"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"mysql","dir":"resp","content":"OK","extra":{"affected_rows":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"mysql","dir":"resp","content":"ERROR","extra":{"error_code":1146,"error":"Table 'db.t' doesn't exist","sqlstate":"42S02","host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ?","extra":{"stmt_id":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"mysql","dir":"req","content":"EXECUTE SELECT name FROM users WHERE age > ?","extra":{"stmt_id":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"redis","dir":"req","content":"SET k1 v1","extra":{"host":"127.0.0.1","port":6379}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"redis","dir":"resp","content":"+OK","extra":{"port":6379}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"type":"redis","dir":"resp","content":"$3000:xxx…","extra":{"port":6379,"truncated":true}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT id, name, age FROM users ORDER BY id","extra":{"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"result","extra":{"rows":4,"fields":3,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"1|alice|30","extra":{"rows":4,"fetched_rows":1,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"INSERT INTO users (name, age) VALUES ('dave', 22)","extra":{"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"OK","extra":{"affected_rows":1,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"ERROR","extra":{"error_code":1146,"error":"Table 'db.t' doesn't exist","sqlstate":"42S02","host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ?","extra":{"stmt_id":1,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"EXECUTE SELECT name FROM users WHERE age > ?","extra":{"stmt_id":1,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"req","content":"SET k1 v1","extra":{"host":"127.0.0.1","port":6379}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"resp","content":"+OK","extra":{"port":6379}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"resp","content":"$3000:xxx…","extra":{"port":6379,"truncated":true}}
 ```
 
 text 格式（`mre.log_format=text`）：
 
 ```
-2026-10-21T12:18:44+08:00 pid=130769 type=redis dir=req content="PING" host=127.0.0.1 port=16379
+2026-10-21T12:18:44+08:00 pid=130769 request_id=130769-3 type=redis dir=req content="PING" host=127.0.0.1 port=16379
 ```
+
+### request_id（请求级唯一标识）
+
+fpm 下同一个 worker 进程（同一个 `pid`）会**串行处理多个请求**，光靠 `pid` 无法区分"哪行日志属于哪个请求"。为此扩展在每次请求初始化（RINIT）时生成请求级标识：
+
+- 格式：`<pid>-<请求序号>`，如 `131951-3` 表示进程 131951 处理的第 3 个请求；序号是**进程内单调递增**计数器（RINIT 递增；ZTS 下为进程级共享计数器，跨线程也不撞号），首个请求之前写的日志（如 MINIT 期告警）为 `<pid>-0`。
+- 同一请求的所有日志行 `request_id` 相同，不同请求不同——json 与 text 两种格式都带该字段，`pid` 字段保持不变。
+- 该标识同时注入脚本回调的 `$context['request_id']`（见下文），路由脚本可用它把"自己写的辅助日志"与扩展日志对齐。
 
 截断策略：SQL ≤ 4096 字节；redis 命令 ≤ 2048 字节（单参数 ≤ 256）；redis 响应摘要 ≤ 512 字节；采样行 ≤ 512 字节（16 列、单列 ≤ 64）。超限置 `extra.truncated=true`。
 
@@ -163,6 +171,9 @@ return null;                              // null/空/非字符串 -> 降级到 
 | `session_id` | `session_id()` 的值（未启动为空串） |
 | `uri` | `$_SERVER['REQUEST_URI'] ?? ''` |
 | `method` | `$_SERVER['REQUEST_METHOD'] ?? ''` |
+| `pid` | 当前进程 id（与日志行 `pid` 字段一致） |
+| `request_id` | 请求级唯一标识 `<pid>-<请求序号>`（与日志行 `request_id` 字段一致，见上文） |
+| `script` | 当前请求 PHP 入口脚本路径：优先 `$_SERVER['SCRIPT_FILENAME']`；CLI/为空回退 `get_included_files()[0]`（首个包含文件即主脚本），再回退 SAPI 的 `path_translated`；都拿不到时为 `''`。用于让路由脚本从入口识别项目 |
 
 `$_SERVER` 原样可读（扩展只读不写，其余超全局同样不被污染；脚本返回后注入的 `$context` 与内部变量 `$___mre_path/$___mre_ret/$___mre_warn` 会被立即移除，脚本不应使用 `___mre_` 前缀的全局变量）。
 
@@ -171,6 +182,27 @@ return null;                              // null/空/非字符串 -> 降级到 
 - 脚本抛异常/解析错误（`ParseError` 也是 `Throwable`，同样被包装串 catch）：降级写规则/主日志，并在主日志记一条一次性 `type:"warn"` 告警（含异常消息摘要）。异常在 PHP 层被捕获，从不进入 C 层引擎状态，脚本错误绝不会让 PHP 进程崩溃或请求失败。
 - 执行前后仅保存/恢复两样东西：调用方执行帧（`EG(current_execute_data)`，置 NULL 让脚本以顶层帧跑在全局符号表上，与引擎执行 {main} 同一机制）与调用方已挂起的异常指针；脚本输出（echo）被捕获丢弃。
 - 局限：脚本内 `exit()/die()` 会终止当前请求（7.4 走 bailout 立即终止；8.x 为优雅 unwind，请求在下一条用户态边界处终止、`exit` 状态码保留，期间的记录仍会落盘）；脚本内发起的 SQL/redis 记录不会再递归调用脚本本身（防重入），而是直接走规则/主日志。
+
+### 自带路由脚本（scripts/mre_log_router.php）
+
+仓库自带一个"按项目 + 按接口"分文件的日志路由脚本，部署时把 `mre.log_script` 指向它即可：
+
+```ini
+mre.log_script = "/opt/mre/scripts/mre_log_router.php"
+; 或环境变量 MRE_LOG_SCRIPT=/opt/mre/scripts/mre_log_router.php
+```
+
+行为（脚本头部有完整注释）：
+
+1. **识别项目**：入口脚本取 `$context['script']`（回退 `$_SERVER['SCRIPT_FILENAME']`），从其所在目录逐级向上找**项目根**——存在 `composer.json`、`think`、`thinkphp/` 目录、`application/` 目录之一即命中（兼容 ThinkPHP5 的 `public/index.php` 入口：`public/` 无标记，上一层即根）。找不到项目根时返回 `null` 降级，不在错误位置建目录。
+2. **日志目录** = `<项目根>/runtime/mre-logs/`，不存在时脚本内 `@mkdir(..., 0755, true)` 递归创建（扩展写日志自身也支持父目录自动创建，二者互为兜底）。
+3. **容器路径映射（/app/cache → /app/origin）**：若项目根位于容器内 `/app/cache/` 前缀下，且把前缀换成 `/app/origin/` 后对应目录存在，则日志落到 `/app/origin/...`——宿主机把 `/code/www`（即 Windows `D:\code\www`）挂载到容器 `/app/origin`，这样日志直接落到宿主机项目目录，无需进容器取日志；映射目标不存在则维持 `/app/cache/...` 原路径。
+4. **文件命名** = `<url路径>.query.log` / `<url路径>.write.log` / `<url路径>.redis.log`（`url路径` 为 base，文件都在 `runtime/mre-logs/` 下）：
+   - base 取 `$_SERVER['REQUEST_URI']` 的 path 部分（去掉 `?`/`#` 之后）→ `rawurldecode` → 安全化：字母数字与 `._-` 保留、其余转 `-`，去首尾 `-`/`.`，截断到 100 字符；不压缩连续 `-`（尽量保持不同路径 → 不同文件）；CLI 或无 `REQUEST_URI` 用 `cli`；有 URI 但安全化后为空（如 `/`）用 `root`。例：`/api/user/list?a=1` → `api-user-list`。
+   - mysql 请求（`dir=req`）：SQL 去前导空白与注释（`--` 行 / `#` 行 / `/*...*/` 块）后，首关键字为 `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN`（大小写不敏感）→ `.query.log`；其余 mysql 语句 → `.write.log`（含 `EXECUTE SELECT ...` 这类预处理执行行，按首关键字判定）。
+   - mysql 响应（`dir=resp`）：路由脚本每条记录独立执行、无跨记录状态，拿不到"响应对应的语句"，按 `extra` 元信息归类——含 `rows`/`fields`/`fetched_rows`（查询结果侧）→ `.query.log`，其余（`affected_rows`/`OK`/`ERROR` 等）→ `.write.log`（SELECT 失败的 ERROR 行会落在 `.write.log`，属已知取舍）。
+   - redis 记录 → `.redis.log`；其他类型 → 返回 `null` 降级。
+5. **防御性**：不输出、不抛异常、不定义顶层具名函数/类（同进程每条记录重复 include，避免 `Cannot redeclare`）、不使用 `___mre_` 前缀变量、除 `$context` 外不产生全局变量（扩展侧另有 ob 捕获 + try/catch 包装兜底）。
 
 ### 优先级示例
 
@@ -243,6 +275,7 @@ Redis（streams 层）：
 ├── mre_gtx.c                   # 跨 fpm 全局事务（注册表 + flock + mysqlnd 入口检查）
 ├── mre_mysql.c                 # mysqlnd conn_data+stmt 方法表挂钩（含 gtx 拦截）
 ├── mre_redis.c                 # tcp 传输工厂包装 + RESP 双向增量解析
+├── scripts/mre_log_router.php  # 自带日志路由脚本（mre.log_script 指向它；按项目根 + URL 路径 + 查询/非查询分文件）
 ├── docs/设计.md                 # 架构设计、版本兼容、阶段B实现取舍
 ├── tests/*.phpt                # 阶段A 2 条 + 阶段B 5 条 + 容器bug回归 2 条 + 脚本回调回归 2 条（ParseError/非字符串降级）
 └── .github/workflows/build.yml # 7.4~8.4 矩阵编译打包
