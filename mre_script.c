@@ -392,6 +392,14 @@ static void mre_ctx_extra(const mre_script_ctxinfo *ci, zval *out)
 		add_assoc_string_ex(out, "sql_full", sizeof("sql_full") - 1,
 			e->sql_full);
 	}
+	if (e->has_time_end) {
+		add_assoc_string_ex(out, "time_end", sizeof("time_end") - 1,
+			e->time_end);
+	}
+	if (e->has_cost) {
+		add_assoc_double_ex(out, "cost_ms", sizeof("cost_ms") - 1,
+			e->cost_ms);
+	}
 }
 
 /* ------------------------------------------------------------------ */

@@ -132,6 +132,26 @@ static void mre_log_emit(FILE *fp, const char *line, size_t len)
 #endif
 }
 
+/* format a millisecond duration with exactly 3 decimals, locale-free:
+ * printf("%.3f") would follow LC_NUMERIC and may render "0,200", which
+ * is neither valid JSON nor stable to parse - do the digit assembly by
+ * hand instead (negative durations clamp to 0) */
+static void mre_fmt_ms3(double ms, char *out, size_t out_cap)
+{
+	long long whole, frac;
+
+	if (!(ms > 0.0)) {
+		ms = 0.0; /* also catches NaN */
+	}
+	whole = (long long)ms;
+	frac = (long long)((ms - (double)whole) * 1000.0 + 0.5);
+	if (frac >= 1000) {
+		whole += 1;
+		frac -= 1000;
+	}
+	snprintf(out, out_cap, "%lld.%03lld", whole, frac);
+}
+
 /* ------------------------------------------------------------------ */
 /* "extra" renderers                                                    */
 /* ------------------------------------------------------------------ */
@@ -275,6 +295,23 @@ static void mre_log_extra_json(char *buf, size_t cap, size_t *len, const mre_ext
 		mre_json_escape(e->sql_full, strlen(e->sql_full), big, sizeof(big));
 		mre_lbuf_appendf(buf, cap, len, "\"sql_full\":\"%s\"", big);
 	}
+	/* timing (mysql req lines only, appended at the end of the object) */
+	if (e->has_time_end) {
+		char tsbuf[48];
+
+		MRE_PUT_SEP();
+		/* rendered by mre_iso8601_now: no JSON-significant bytes, but
+		 * stay uniform and escape anyway */
+		mre_json_escape(e->time_end, strlen(e->time_end), tsbuf, sizeof(tsbuf));
+		mre_lbuf_appendf(buf, cap, len, "\"time_end\":\"%s\"", tsbuf);
+	}
+	if (e->has_cost) {
+		char msbuf[48];
+
+		mre_fmt_ms3(e->cost_ms, msbuf, sizeof(msbuf));
+		MRE_PUT_SEP();
+		mre_lbuf_appendf(buf, cap, len, "\"cost_ms\":%s", msbuf);
+	}
 
 	mre_lbuf_appendf(buf, cap, len, "}");
 
@@ -336,6 +373,16 @@ static void mre_log_extra_text(char *buf, size_t cap, size_t *len, const mre_ext
 		mre_json_escape(e->sql_full, strlen(e->sql_full), big, sizeof(big));
 		mre_lbuf_appendf(buf, cap, len, " sql_full=\"%s\"", big);
 	}
+	/* timing (mysql req lines only, appended at end of line) */
+	if (e->has_time_end) {
+		mre_lbuf_appendf(buf, cap, len, " time_end=%s", e->time_end);
+	}
+	if (e->has_cost) {
+		char msbuf[48];
+
+		mre_fmt_ms3(e->cost_ms, msbuf, sizeof(msbuf));
+		mre_lbuf_appendf(buf, cap, len, " cost_ms=%s", msbuf);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -365,6 +412,13 @@ static void mre_log_emit_record(const char *target,
 	}
 
 	mre_iso8601_now(tsbuf, sizeof(tsbuf));
+	if (extra && extra->has_time_start) {
+		/* mysql req lines are written after the call finished so the
+		 * measured duration exists; the top-level "time" must stay the
+		 * call START time, which the caller passes in extra */
+		mre_copy_str(tsbuf, sizeof(tsbuf),
+			extra->time_start, strlen(extra->time_start));
+	}
 
 	if (MRE_G(cfg).json_format) {
 		char typebuf[16], dirbuf[16];

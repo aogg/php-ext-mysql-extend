@@ -132,6 +132,15 @@ typedef struct {
 	zend_bool truncated;
 	zend_bool has_cmd;        /* mysql req only: query/prepare/execute */
 	char      cmd[10];
+	zend_bool has_time_start; /* override the line's top-level "time":
+	                           * mysql req lines are written after the
+	                           * call finished, so they must carry the
+	                           * wall time captured at call start       */
+	char      time_start[40];
+	zend_bool has_time_end;   /* extra.time_end: response wall time     */
+	char      time_end[40];
+	zend_bool has_cost;       /* extra.cost_ms: duration in ms          */
+	double    cost_ms;
 	zend_bool has_prepared;   /* render extra.prepared {sql, params}  */
 	unsigned  param_total;    /* bound params reported by mysqlnd     */
 	unsigned  param_cap;      /* params captured (<= MRE_PARAM_MAX)   */
@@ -288,6 +297,9 @@ void mre_redis_rehook(void);    /* per request: re-apply if replaced */
 /* Small utils (mre_util.c)                                            */
 /* ------------------------------------------------------------------ */
 void mre_iso8601_now(char *buf, size_t cap);           /* 2026-...+08:00 */
+double mre_clock_mono_ms(void);
+             /* monotonic clock reading in ms (duration measuring;
+              * deltas are immune to wall-clock step changes) */
 size_t mre_json_escape(const char *in, size_t in_len,
                        char *out, size_t out_cap);     /* out NUL-term   */
 void mre_fmt_double(double d, char *out, size_t out_cap);

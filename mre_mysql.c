@@ -146,6 +146,25 @@ static void mre_extra_error(mre_extra *e, MYSQLND_ERROR_INFO *info)
 	}
 }
 
+/* fill one req line's timing block: the wall time captured at call
+ * start (overrides the line's top-level "time", which would otherwise
+ * be the write moment - the req line is written AFTER the call so the
+ * duration exists), the wall time of the response and the monotonic
+ * delta between the two clock readings in milliseconds.
+ * start == end with cost 0 marks "never really sent" (deferred COMMIT) */
+static void mre_extra_timing(mre_extra *e, const char *time_start,
+                             const char *time_end, double cost_ms)
+{
+	e->has_time_start = (zend_bool)1;
+	mre_copy_str(e->time_start, sizeof(e->time_start),
+		time_start, strlen(time_start));
+	e->has_time_end = (zend_bool)1;
+	mre_copy_str(e->time_end, sizeof(e->time_end),
+		time_end, strlen(time_end));
+	e->has_cost = (zend_bool)1;
+	e->cost_ms = (cost_ms > 0.0) ? cost_ms : 0.0;
+}
+
 static uint64_t mre_affected_rows(MYSQLND_CONN_DATA *conn)
 {
 	return (conn && conn->upsert_status) ? conn->upsert_status->affected_rows : 0;
@@ -646,18 +665,32 @@ static enum_func_status mre_hook_query(MYSQLND_CONN_DATA * conn,
 	mre_mysql_ctx *ctx = mre_ctx_get(conn);
 	int qkind = mre_gtx_sql_kind(query, query_len);
 	zend_bool gtx_on = mre_gtx_enabled();
+	zend_bool log_on = mre_mysql_enabled();
+	double mono_start = 0.0;
+	char time_start[40];
+
+	/* start clock before the statement reaches the server; the req
+	 * line itself is written after the call returned (it carries the
+	 * measured duration), with time_start overriding its top-level
+	 * "time" so the semantic start moment is preserved */
+	if (log_on) {
+		mono_start = mre_clock_mono_ms();
+		mre_iso8601_now(time_start, sizeof(time_start));
+	}
 
 	/* stage B: transaction control interception happens BEFORE the
 	 * statement reaches the server */
 	if (gtx_on && ctx
 			&& mre_gtx_pre_call(conn, &ctx->gtx, query, query_len, qkind)) {
 		/* COMMIT intercepted and deferred: report success, tx stays open */
-		if (mre_mysql_enabled()) {
+		if (log_on) {
 			mre_extra e;
 
 			mre_extra_conn(&e, conn);
 			e.has_cmd = (zend_bool)1;
 			mre_copy_str(e.cmd, sizeof(e.cmd), "query", 5);
+			/* nothing was sent: time_end == time, cost 0 */
+			mre_extra_timing(&e, time_start, time_start, 0.0);
 			mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, query,
 				MIN(query_len, (size_t)(MRE_MAX_SQL_LOG - 1)), &e);
 
@@ -672,12 +705,17 @@ static enum_func_status mre_hook_query(MYSQLND_CONN_DATA * conn,
 
 	ret = mre_orig_query(conn, query, query_len);
 
-	if (mre_mysql_enabled() && query) {
+	if (log_on && query) {
 		mre_extra e;
+		char time_end[40];
+
+		mre_iso8601_now(time_end, sizeof(time_end));
 
 		mre_extra_conn(&e, conn);
 		e.has_cmd = (zend_bool)1;
 		mre_copy_str(e.cmd, sizeof(e.cmd), "query", 5);
+		mre_extra_timing(&e, time_start, time_end,
+			mre_clock_mono_ms() - mono_start);
 		mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, query,
 			MIN(query_len, (size_t)(MRE_MAX_SQL_LOG - 1)), &e);
 
@@ -785,14 +823,30 @@ static enum_func_status mre_hook_stmt_prepare(MYSQLND_STMT * const stmt,
                                               const char * const query,
                                               const size_t query_len)
 {
-	enum_func_status ret = mre_orig_stmt_prepare(stmt, query, query_len);
+	enum_func_status ret;
+	zend_bool log_on;
+	double mono_start = 0.0;
+	char time_start[40];
 
-	if (mre_mysql_enabled() && stmt && stmt->data && query) {
+	/* start clock before the COM_STMT_PREPARE roundtrip; same "req line
+	 * written after the call" scheme as mre_hook_query */
+	log_on = (zend_bool)(mre_mysql_enabled() && stmt && stmt->data && query);
+	if (log_on) {
+		mono_start = mre_clock_mono_ms();
+		mre_iso8601_now(time_start, sizeof(time_start));
+	}
+
+	ret = mre_orig_stmt_prepare(stmt, query, query_len);
+
+	if (log_on) {
 		MYSQLND_STMT_DATA *d = stmt->data;
 		mre_extra e;
 		mre_mysql_ctx *ctx = d->conn ? mre_ctx_get(d->conn) : NULL;
 		const char *resp_word;
 		size_t resp_len;
+		char time_end[40];
+
+		mre_iso8601_now(time_end, sizeof(time_end));
 
 		if (ctx) {
 			mre_ctx_remember_sql(ctx, query, query_len);
@@ -802,6 +856,8 @@ static enum_func_status mre_hook_stmt_prepare(MYSQLND_STMT * const stmt,
 		e.stmt_id = d->stmt_id;
 		e.has_cmd = (zend_bool)1;
 		mre_copy_str(e.cmd, sizeof(e.cmd), "prepare", 7);
+		mre_extra_timing(&e, time_start, time_end,
+			mre_clock_mono_ms() - mono_start);
 		mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, query,
 			MIN(query_len, (size_t)(MRE_MAX_SQL_LOG - 1)), &e);
 
@@ -863,6 +919,15 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 	zend_bool have_pi = (zend_bool)0;
 	int qkind = MRE_GTX_Q_NONE;
 	zend_bool gtx_on = mre_gtx_enabled();
+	zend_bool log_on = mre_mysql_enabled();
+	double mono_start = 0.0;
+	char time_start[40];
+
+	if (log_on) {
+		/* wall start time at hook entry: the deferred-COMMIT branch
+		 * (nothing sent) needs it as both "time" and "time_end" */
+		mre_iso8601_now(time_start, sizeof(time_start));
+	}
 
 	if (stmt && stmt->data) {
 		d = stmt->data;
@@ -875,7 +940,7 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 				&& mre_gtx_pre_call(conn, &ctx->gtx, ctx->sql, ctx->sql_len,
 					qkind)) {
 			/* deferred COMMIT via prepared statement: report success */
-			if (mre_mysql_enabled()) {
+			if (log_on) {
 				mre_extra e;
 
 				mre_extra_conn(&e, conn);
@@ -883,6 +948,8 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 				e.stmt_id = d->stmt_id;
 				e.has_cmd = (zend_bool)1;
 				mre_copy_str(e.cmd, sizeof(e.cmd), "query", 5);
+				/* nothing was sent: time_end == time, cost 0 */
+				mre_extra_timing(&e, time_start, time_start, 0.0);
 				mre_log_write(MRE_TYPE_MYSQL, MRE_DIR_REQ, "COMMIT",
 					sizeof("COMMIT") - 1, &e);
 
@@ -904,6 +971,10 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 				ctx ? ctx->sql_len : 0);
 			have_pi = (zend_bool)1;
 		}
+		/* start the duration clock right before the roundtrip */
+		if (log_on) {
+			mono_start = mre_clock_mono_ms();
+		}
 	} else {
 		d = NULL;
 		conn = NULL;
@@ -912,7 +983,7 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 
 	ret = mre_orig_stmt_execute(stmt);
 
-	if (mre_mysql_enabled() && stmt && stmt->data) {
+	if (log_on && stmt && stmt->data) {
 		MYSQLND_STMT_DATA *d = stmt->data;
 		MYSQLND_CONN_DATA *conn = d->conn;
 		mre_mysql_ctx *ctx = conn ? mre_ctx_get(conn) : NULL;
@@ -921,6 +992,9 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 		size_t clen = 0;
 		const char *resp_word;
 		size_t resp_len;
+		char time_end[40];
+
+		mre_iso8601_now(time_end, sizeof(time_end));
 
 		/* pure SQL only: the prepare-time statement itself, no prefix.
 		 * The "this is an execute" information lives in extra.cmd. */
@@ -932,6 +1006,8 @@ static enum_func_status mre_hook_stmt_execute(MYSQLND_STMT * const stmt)
 		e.stmt_id = d->stmt_id;
 		e.has_cmd = (zend_bool)1;
 		mre_copy_str(e.cmd, sizeof(e.cmd), "execute", 7);
+		mre_extra_timing(&e, time_start, time_end,
+			mre_clock_mono_ms() - mono_start);
 		if (have_pi) {
 			mre_extra_set_prepared(&e, &pi);
 		}

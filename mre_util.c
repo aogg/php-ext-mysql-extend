@@ -78,6 +78,35 @@ void mre_iso8601_now(char *buf, size_t cap)
 }
 
 /* ------------------------------------------------------------------ */
+/* mre_clock_mono_ms: monotonic clock reading, milliseconds             */
+/*                                                                      */
+/* Used to measure durations (only differences are interpreted, so the  */
+/* absolute origin does not matter).  CLOCK_MONOTONIC never steps back  */
+/* with NTP/adjtime, unlike the wall clock rendered by                  */
+/* mre_iso8601_now().  Resolution is nanoseconds on Linux; the returned */
+/* double keeps microsecond precision far beyond any process uptime.    */
+/* ------------------------------------------------------------------ */
+double mre_clock_mono_ms(void)
+{
+#ifdef PHP_WIN32
+	LARGE_INTEGER freq, counter;
+
+	if (!QueryPerformanceFrequency(&freq)
+			|| !QueryPerformanceCounter(&counter) || freq.QuadPart == 0) {
+		return 0.0; /* cannot happen on a live system; delta just reads 0 */
+	}
+	return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0.0;
+	}
+	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+}
+
+/* ------------------------------------------------------------------ */
 /* mre_request_id: request-level unique id "<pid>-<seq>"                */
 /*                                                                      */
 /* Under fpm the same worker process (one pid) serves many requests     */

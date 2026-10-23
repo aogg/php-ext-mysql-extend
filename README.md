@@ -2,7 +2,7 @@
 
 一个 PHP C 扩展（扩展名 `mre`），在 PHP 进程内部捕获并记录：
 
-- **MySQL 流量**：通过 mysqlnd 扩展点拦截，覆盖 **mysqli、PDO_MYSQL**（两者底层都走 mysqlnd）以及一切基于 mysqlnd 的连接类；记录 SQL 文本、影响行数/返回行数、错误码/错误信息，返回行内容可按条数采样（默认 1 行）。
+- **MySQL 流量**：通过 mysqlnd 扩展点拦截，覆盖 **mysqli、PDO_MYSQL**（两者底层都走 mysqlnd）以及一切基于 mysqlnd 的连接类；记录 SQL 文本、执行起止时间与耗时（`extra.time_end`/`extra.cost_ms`）、影响行数/返回行数、错误码/错误信息，返回行内容可按条数采样（默认 1 行）。
 - **Redis 流量**：通过 PHP streams 传输层嗅探 RESP 协议，覆盖 **phpredis（Redis/RedisCluster 扩展类）与 Predis（用户态类）**——两者建连最终都走 PHP streams，记录发送的命令与返回的响应。
 - 日志一行一条，默认 JSON lines，`flock` 保证多进程（fpm）并发安全；支持写入文件、`stdout`、`stderr` 以及 **`/proc/1/fd/1`（docker 容器内输出到 pid1 stdout）**。
 
@@ -83,20 +83,23 @@ docker run \
 
 ## 日志格式
 
-JSON lines（默认），字段：`time`（ISO8601 本地时区）、`pid`、`request_id`（请求级唯一标识，见下）、`type`（`mysql|redis`）、`dir`（`req|resp`）、`content`、`extra`（行数/错误等，可能为 `null`）：
+JSON lines（默认），字段：`time`（ISO8601 本地时区；mysql 请求行为执行**开始**时刻，见下文「执行耗时与起止时间」）、`pid`、`request_id`（请求级唯一标识，见下）、`type`（`mysql|redis`）、`dir`（`req|resp`）、`content`、`extra`（行数/错误/耗时等，可能为 `null`）：
 
 ```json
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT id, name, age FROM users ORDER BY id","extra":{"cmd":"query","host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT id, name, age FROM users ORDER BY id","extra":{"cmd":"query","host":"127.0.0.1","port":3306,"time_end":"2026-10-21T12:24:16+08:00","cost_ms":0.412}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"result","extra":{"rows":4,"fields":3,"host":"127.0.0.1","port":3306}}
 {"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"1|alice|30","extra":{"rows":4,"fetched_rows":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"INSERT INTO users (name, age) VALUES ('dave', 22)","extra":{"cmd":"query","host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"OK","extra":{"affected_rows":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"ERROR","extra":{"error_code":1146,"error":"Table 'db.t' doesn't exist","sqlstate":"42S02","host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ?","extra":{"cmd":"prepare","stmt_id":1,"host":"127.0.0.1","port":3306}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ? AND name = ?","extra":{"cmd":"execute","stmt_id":1,"host":"127.0.0.1","port":3306,"prepared":{"sql":"SELECT name FROM users WHERE age > ? AND name = ?","params":[18,"bob"]},"sql_full":"SELECT name FROM users WHERE age > 18 AND name = 'bob'"}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"req","content":"SET k1 v1","extra":{"host":"127.0.0.1","port":6379}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"resp","content":"+OK","extra":{"port":6379}}
-{"time":"2026-10-21T12:24:16+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"resp","content":"$3000:xxx…","extra":{"port":6379,"truncated":true}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"INSERT INTO users (name, age) VALUES ('dave', 22)","extra":{"cmd":"query","host":"127.0.0.1","port":3306,"time_end":"2026-10-21T12:24:17+08:00","cost_ms":0.385}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"OK","extra":{"affected_rows":1,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT * FROM no_such_table","extra":{"cmd":"query","host":"127.0.0.1","port":3306,"time_end":"2026-10-21T12:24:17+08:00","cost_ms":0.298}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"ERROR","extra":{"error_code":1146,"error":"Table 'db.no_such_table' doesn't exist","sqlstate":"42S02","host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ?","extra":{"cmd":"prepare","stmt_id":1,"host":"127.0.0.1","port":3306,"time_end":"2026-10-21T12:24:17+08:00","cost_ms":0.301}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"resp","content":"PREPARED","extra":{"stmt_id":1,"fields":1,"host":"127.0.0.1","port":3306}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT name FROM users WHERE age > ? AND name = ?","extra":{"cmd":"execute","stmt_id":1,"host":"127.0.0.1","port":3306,"prepared":{"sql":"SELECT name FROM users WHERE age > ? AND name = ?","params":[18,"bob"]},"sql_full":"SELECT name FROM users WHERE age > 18 AND name = 'bob'","time_end":"2026-10-21T12:24:17+08:00","cost_ms":0.356}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"mysql","dir":"req","content":"SELECT SLEEP(0.2)","extra":{"cmd":"query","host":"127.0.0.1","port":3306,"time_end":"2026-10-21T12:24:17+08:00","cost_ms":200.471}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"req","content":"SET k1 v1","extra":{"host":"127.0.0.1","port":6379}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"resp","content":"+OK","extra":{"port":6379}}
+{"time":"2026-10-21T12:24:17+08:00","pid":131951,"request_id":"131951-1","type":"redis","dir":"resp","content":"$3000:xxx…","extra":{"port":6379,"truncated":true}}
 ```
 
 ### content 恒为纯 SQL，执行动作看 extra.cmd
@@ -111,11 +114,25 @@ mysql 的 **`dir=req` 记录 `content` 恒为纯 SQL 文本，永不加前缀**�
 
 > 类型忠实度说明：绑定值按 mysqlnd 记录的声明类型（`MYSQLND_STMT_DATA.param_bind[i].type`）渲染——`i`→整型、`d`→浮点、`s`→字符串、`b`→blob 十六进制摘要、NULL→`null`；声明类型与变量实际类型不一致时按声明类型做与 mysqlnd 相同的数值转换（如 `'i'` 绑定字符串 `"5"` 渲染为 `5`）。
 
-text 格式（`mre.log_format=text`），新字段以 `cmd=` / `params=` / `sql_full=` 追加：
+### 执行耗时与起止时间（extra.time_end / extra.cost_ms）
+
+mysql 的 `dir=req` 记录（`cmd=query` / `prepare` / `execute` 三类）在 `extra` 里携带执行计时（`dir=resp` 与 redis/gtx 收尾行不带；resp 行自身的 `time` 即响应时刻，语义不变）：
+
+- `extra.time_end`：**返回时间**。格式与顶层 `time` 完全一致（ISO8601 带本地时区，如 `2026-10-21T12:24:16+08:00`，秒级精度）。
+- `extra.cost_ms`：**花费时间**，毫秒，JSON 数字，固定保留 3 位小数。内部用 `CLOCK_MONOTONIC` 时钟算差值（纳秒级分辨率、不受系统改表/回拨影响），墙钟只用来取 `time`/`time_end` 字符串。
+- 顶层 `time` 语义不变 = **执行开始时刻**（SQL 发起时间）。实现上 req 行在原始调用执行完成后才落盘（写入时刻已晚于发起），行内 `time` 由扩展显式回填为调用开始时刻，因此 `time < time_end` 恒成立（或相等）。
+- **执行失败同样记录**：后续 resp 为 `ERROR` 的查询，其 req 行照常带 `time_end`/`cost_ms`——慢失败查询正是排查重点。
+- gtx 延迟 COMMIT 分支（语句未真正发给 server）：`time_end`=`time`、`cost_ms=0`。
+- 脚本路由 `$context['extra']` 同步暴露 `time_end`（字符串）与 `cost_ms`（浮点数）。
+
+> **已知取舍**：req 行改为"执行完落盘"后，执行中途进程被杀（崩溃/`kill -9`）的查询不会再产生 req 行。此前"只有 req 没有 resp"可以推断查询挂起，现在这类查询**整行缺失**（两者都没有）；需要监控挂起时请结合业务超时与 `cost_ms` 分布。
+
+text 格式（`mre.log_format=text`），新字段以 `cmd=` / `params=` / `sql_full=` 追加，计时以 `time_end=` / `cost_ms=` 追加在行尾：
 
 ```
 2026-10-21T12:18:44+08:00 pid=130769 request_id=130769-3 type=redis dir=req content="PING" host=127.0.0.1 port=16379
-2026-10-21T12:18:45+08:00 pid=130769 request_id=130769-4 type=mysql dir=req content="SELECT name FROM users WHERE age > ? AND name = ?" cmd=execute stmt_id=1 host=127.0.0.1 port=3306 params=[18,"bob"] sql_full="SELECT name FROM users WHERE age > 18 AND name = 'bob'"
+2026-10-21T12:18:45+08:00 pid=130769 request_id=130769-4 type=mysql dir=req content="SELECT name FROM users WHERE age > ? AND name = ?" cmd=execute stmt_id=1 host=127.0.0.1 port=3306 params=[18,"bob"] sql_full="SELECT name FROM users WHERE age > 18 AND name = 'bob'" time_end=2026-10-21T12:18:45+08:00 cost_ms=0.356
+2026-10-21T12:18:46+08:00 pid=130769 request_id=130769-5 type=mysql dir=req content="SELECT SLEEP(0.2)" cmd=query host=127.0.0.1 port=3306 time_end=2026-10-21T12:18:46+08:00 cost_ms=200.471
 ```
 
 ### request_id（请求级唯一标识）
@@ -176,7 +193,7 @@ return null;                              // null/空/非字符串 -> 降级到 
 | `type` | `mysql` 或 `redis` |
 | `dir` | `req` 或 `resp` |
 | `content` | SQL 或 redis 命令/响应文本 |
-| `extra` | 行数/错误信息数组（`cmd`（mysql req 专有：`query`/`prepare`/`execute`）/`affected_rows`/`rows`/`fetched_rows`/`fields`/`stmt_id`/`error_code`/`error`/`sqlstate`/`host`/`port`/`truncated`/`prepared`（execute 且有绑定参数时：`sql` 同 content、`params` 数组、超 32 个时 `truncated=true`）/`sql_full`（execute 且有绑定参数时：`?` 替换为字面量后的 SQL），仅含存在项） |
+| `extra` | 行数/错误信息数组（`cmd`（mysql req 专有：`query`/`prepare`/`execute`）/`affected_rows`/`rows`/`fetched_rows`/`fields`/`stmt_id`/`error_code`/`error`/`sqlstate`/`host`/`port`/`truncated`/`prepared`（execute 且有绑定参数时：`sql` 同 content、`params` 数组、超 32 个时 `truncated=true`）/`sql_full`（execute 且有绑定参数时：`?` 替换为字面量后的 SQL）/`time_end`（mysql req 专有：返回时间字符串，同顶层 `time` 格式）/`cost_ms`（mysql req 专有：执行耗时毫秒，浮点），仅含存在项） |
 | `headers` | 当前 HTTP 请求全部 header（由 `$_SERVER` 的 `HTTP_*` 与 `CONTENT_TYPE`/`CONTENT_LENGTH` 整理成 `小写名 => 值`，如 `x-foo-bar`；CLI 下为 `[]`） |
 | `post` | `$_POST` 原样 |
 | `cookie` | `$_COOKIE` 原样 |
@@ -281,7 +298,7 @@ Redis（streams 层）：
 ├── php_mre.h                   # 公共头：常量/配置结构/全局/各模块原型
 ├── mre.c                       # 模块生命周期、INI 注册、MINFO、函数表
 ├── mre_config.c                # env(MRE_*) > ini(mre.*) 配置解析
-├── mre_util.c                  # ISO8601 时间、JSON 转义、安全拷贝、mkdir -p
+├── mre_util.c                    # ISO8601 时间、单调时钟（耗时测量）、JSON 转义、安全拷贝、mkdir -p
 ├── mre_log.c                   # 统一日志写入器（flock/句柄缓存/降级/路由接入）
 ├── mre_yaml.c                  # 内置精简 YAML 解析器（映射/序列/块标量/注释）
 ├── mre_rules.c                 # yaml 规则引擎（PCRE2 编译缓存 + 首中路由）
