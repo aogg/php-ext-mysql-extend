@@ -56,7 +56,8 @@ php -i | grep -A 14 '^mre$'
 | `mre.sample_rows` | `MRE_SAMPLE_ROWS` | `1` | 每个结果集采样记录的行数（0 表示不采样内容，只记元信息；上限 100） |
 | `mre.state_dir` | `MRE_STATE_DIR` | 空（默认 `/tmp`） | 状态目录（全局事务注册表位置；为空时 gtx 使用 `/tmp`） |
 | `mre.yaml_config` | `MRE_YAML_CONFIG` | 空 | YAML 规则文件路径（规则格式见下文；文件变化自动热加载并重编译正则） |
-| `mre.log_script` | `MRE_LOG_SCRIPT` | 空 | PHP 脚本绝对路径。启用后每条记录写日志前执行该脚本，脚本 `return '路径'` 决定本条记录的日志文件（详见下文） |
+| `mre.log_script` | `MRE_LOG_SCRIPT` | 空 | PHP 脚本绝对路径。启用后每条记录写日志前**同步**执行该脚本，脚本 `return '路径'` 决定本条记录的日志文件（详见下文） |
+| `mre.log_script_async` | `MRE_LOG_SCRIPT_ASYNC` | 空 | 异步脚本绝对路径。非空且 `mre.enable=1` 时**每条记录 fork 一个子进程执行脚本（请求零等待）**：**扩展不再落盘任何日志**、也不执行 `mre.log_script`；脚本自己 `flock + fwrite($context['line']."\n")`。`$context` 在此模式额外带 `line`/`format`。fork 失败或 ZTS 构建下丢弃该条并每进程告警一次（不回落同步）。详见 [docs/异步脚本.md](docs/异步脚本.md) |
 | `mre.gtx` | `MRE_GTX` | `0` | 跨 fpm 全局事务开关。**默认关闭**，防止生产误开；开启后 `mre_gtx_*` 函数才可用 |
 | `mre.gtx_timeout` | `MRE_GTX_TIMEOUT` | `300` | 全局事务窗口最长存活秒数（10~86400），超时后第一次访问自动判定窗口失效并全部回滚（安全优先） |
 
@@ -213,13 +214,32 @@ return null;                              // null/空/非字符串 -> 降级到 
 - 执行前后仅保存/恢复两样东西：调用方执行帧（`EG(current_execute_data)`，置 NULL 让脚本以顶层帧跑在全局符号表上，与引擎执行 {main} 同一机制）与调用方已挂起的异常指针；脚本输出（echo）被捕获丢弃。
 - 局限：脚本内 `exit()/die()` 会终止当前请求（7.4 走 bailout 立即终止；8.x 为优雅 unwind，请求在下一条用户态边界处终止、`exit` 状态码保留，期间的记录仍会落盘）；脚本内发起的 SQL/redis 记录不会再递归调用脚本本身（防重入），而是直接走规则/主日志。
 
+### 异步脚本（`mre.log_script_async`）
+
+值为 PHP 脚本**绝对路径**。`mre.log_script_async`（或 `MRE_LOG_SCRIPT_ASYNC`）非空且 `mre.enable=1` 时进入异步模式：
+
+- **扩展不写任何日志**：既不再写 `mre.log_file`，也不执行 `mre.log_script`、不跑 yaml 规则；每条记录只交给一个 fork 出来的子进程。
+- **请求零等待**：父进程 `fork()` 后立即返回；子进程再 fork 一次后退出，孙进程执行脚本（见 `docs/设计.md` §9）。
+- **脚本自己落盘**：`$context` 在同步字段之外额外提供 `line`（扩展已渲染好的整行，json 或 text，**不含结尾换行**）与 `format`（`json`/`text`）。脚本负责 `mkdir`（目录不存在时）、`flock(LOCK_EX)`、`fwrite($line."\n")`。因为 `line` 就是扩展原本会写出的字节，异步与同步的日志格式零漂移。
+- **故障降级**：fork 失败或 ZTS 构建下**丢弃该条记录**并每进程告警一次，绝不回落同步、绝不阻塞请求；子进程内脚本 `stat` 失败/异常则静默结束该子进程（脚本自己的错误请写自己的错误日志）。
+- 仓库自带的 `scripts/mre_log_router.php`（以及 include 它的 `mre_oo_log_script.php`）**已内置自写模式**：检测到 `$context['line']` 就自行追加落盘，脚本文件不用改。迁移只需把 ini 里的 `mre.log_script` 换成 `mre.log_script_async`（路径不变），详见 [docs/异步脚本.md](docs/异步脚本.md)。
+
+```ini
+; 同步配置
+; mre.log_script = "/opt/mre/scripts/mre_log_router.php"
+; 迁移到异步配置（同一脚本路径，仅键名改变）：
+mre.log_script_async = "/opt/mre/scripts/mre_log_router.php"
+```
+
 ### 自带路由脚本（scripts/mre_log_router.php）
 
-仓库自带一个"按项目 + 按接口"分文件的日志路由脚本，部署时把 `mre.log_script` 指向它即可：
+仓库自带一个"按项目 + 按接口"分文件的日志路由脚本，部署时把 `mre.log_script`（同步）或 `mre.log_script_async`（异步，脚本自写）指向它即可：
 
 ```ini
 mre.log_script = "/opt/mre/scripts/mre_log_router.php"
 ; 或环境变量 MRE_LOG_SCRIPT=/opt/mre/scripts/mre_log_router.php
+; 异步（扩展不落盘、脚本自己 flock+fwrite）：
+; mre.log_script_async = "/opt/mre/scripts/mre_log_router.php"
 ```
 
 行为（脚本头部有完整注释）：
@@ -263,7 +283,7 @@ mre.log_script = "/opt/mre/scripts/mre_log_router.php"
 - 拦截针对连接级：全局窗口开启期间，窗口内连接的**所有** COMMIT 都会被延迟（这是特性也是约束——需要细粒度独立事务的连接不应在窗口期间开启事务）。
 - 连接若带未读结果集（unbuffered）时执行强制 ROLLBACK/COMMIT 会触发“commands out of sync”，该次收尾失败仍会注销连接（服务端最终回滚）；建议在结果集取完后再进入全局事务窗口。
 - 业务主动发 `ROLLBACK` 视为退出窗口（连接注销，不再被收尾管理）。
-- 注册表为 `<state_dir>/mre-gtx.reg` 行式文本 + `<state_dir>/mre-gtx.lock`（flock 串行化读改写，数据文件 rename 原子替换），格式见 `docs/设计.md` §9。
+- 注册表为 `<state_dir>/mre-gtx.reg` 行式文本 + `<state_dir>/mre-gtx.lock`（flock 串行化读改写，数据文件 rename 原子替换），格式见 `docs/设计.md` §10。
 - Windows 无 `kill()` 判活，死进程清理降级为仅超时清理（本扩展以 Linux 部署为主）。
 
 ## 导出的 PHP 函数
@@ -303,6 +323,7 @@ Redis（streams 层）：
 ├── mre_yaml.c                  # 内置精简 YAML 解析器（映射/序列/块标量/注释）
 ├── mre_rules.c                 # yaml 规则引擎（PCRE2 编译缓存 + 首中路由）
 ├── mre_script.c                # 日志路径脚本回调（php层 try/catch include 包装 + 全局符号表注入）
+├── mre_async.c                 # 异步脚本执行（每条记录双 fork、父进程零等待、ZTS 禁用）
 ├── mre_gtx.c                   # 跨 fpm 全局事务（注册表 + flock + mysqlnd 入口检查）
 ├── mre_mysql.c                 # mysqlnd conn_data+stmt 方法表挂钩（含 gtx 拦截）
 ├── mre_redis.c                 # tcp 传输工厂包装 + RESP 双向增量解析

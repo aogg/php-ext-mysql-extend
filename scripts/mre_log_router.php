@@ -33,6 +33,12 @@
  *      - redis 记录归 .redis.log；
  *      - 其他类型（warn 不走路由）返回 null 降级。
  *
+ * 异步模式（mre.log_script_async / MRE_LOG_SCRIPT_ASYNC，扩展不落盘）：
+ *   扩展会在 $context 里额外提供 line（已渲染好的整行，不含结尾换行）与
+ *   format（json|text）。本脚本检测到 `line` 后，在算出的路径上自行
+ *   flock + fwrite(line."\n")（目录上面已确保存在）；返回值照旧，
+ *   异步模式下扩展忽略返回值，同步模式行为完全不变（无重复写）。
+ *
  * 防御性约定：本脚本被同一进程每条记录重复 include，因此不定义顶层具名函数、
  * 不声明类（避免 Cannot redeclare）；全部逻辑在闭包内完成，除扩展注入并回收的
  * $context 外不产生任何全局变量；不使用 ___mre_ 前缀变量（扩展保留名）；
@@ -81,12 +87,12 @@ return call_user_func(function () use ($context) {
     }
 
     /* ---- 2) 容器 /app/cache → /app/origin 路径映射 ---- */
-    if (strpos($root, '/app/cache/') === 0) {
-        $alt = '/app/origin/' . substr($root, strlen('/app/cache/'));
-        if (is_dir($alt)) {
-            $root = $alt;
-        }
-    }
+    // if (strpos($root, '/app/cache/') === 0) {
+    //     $alt = '/app/origin/' . substr($root, strlen('/app/cache/'));
+    //     if (is_dir($alt)) {
+    //         $root = $alt;
+    //     }
+    // }
 
     /* ---- 3) 日志目录（脚本侧确保存在，扩展写日志另有 mkdir -p 兜底） ---- */
     $logDir = $root . '/runtime/mre-logs';
@@ -168,5 +174,28 @@ return call_user_func(function () use ($context) {
         return null; /* 未知类型：降级到 yaml 规则 / 主日志 */
     }
 
-    return $logDir . '/' . $base . $suffix;
+    $path = $logDir . '/' . $base . $suffix;
+
+    /* ---- 6) 异步自写模式（mre.log_script_async） ----
+     * 异步模式下扩展不落盘，$context 额外带两个键：
+     *   - line：扩展已渲染好的整行日志（json 或 text，不含结尾换行）；
+     *   - format："json" 或 "text"。
+     * 脚本职责：自己 flock + fwrite(line."\n")，目录上面已确保存在。
+     * 同步模式下 `line` 不存在，行为与旧版完全一致（扩展照旧用返回值
+     * 决定写入文件，不会有重复写）。返回值保持原样：异步模式下扩展忽略它。 */
+    $v = isset($context['line']) ? $context['line'] : null;
+    $line = is_string($v) ? $v : null;
+    if ($line !== null) {
+        $fp = @fopen($path, 'ab');
+        if ($fp !== false) {
+            if (flock($fp, LOCK_EX)) {
+                fwrite($fp, $line . "\n");
+                fflush($fp);
+                flock($fp, LOCK_UN);
+            }
+            fclose($fp);
+        }
+    }
+
+    return $path;
 });

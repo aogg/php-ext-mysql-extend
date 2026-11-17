@@ -39,6 +39,7 @@ if test "$PHP_MRE" != "no"; then
      mre_yaml.c \
      mre_rules.c \
      mre_script.c \
+     mre_async.c \
      mre_gtx.c \
      mre_mysql.c \
      mre_redis.c],

@@ -177,6 +177,8 @@ void mre_config_refresh(void)
 		"MRE_LOG_FILE", "mre.log_file");
 	mre_cfg_str(cfg->log_script, sizeof(cfg->log_script),
 		"MRE_LOG_SCRIPT", "mre.log_script");
+	mre_cfg_str(cfg->log_script_async, sizeof(cfg->log_script_async),
+		"MRE_LOG_SCRIPT_ASYNC", "mre.log_script_async");
 	mre_cfg_str(cfg->state_dir, sizeof(cfg->state_dir),
 		"MRE_STATE_DIR", "mre.state_dir");
 	mre_cfg_str(cfg->yaml_config, sizeof(cfg->yaml_config),

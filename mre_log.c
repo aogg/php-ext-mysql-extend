@@ -394,21 +394,28 @@ void mre_extra_init(mre_extra *e)
 	memset(e, 0, sizeof(*e));
 }
 
-/* core emitter: format one record and append it to `target` */
-static void mre_log_emit_record(const char *target,
-                                const char *type, const char *dir,
-                                const char *content, size_t content_len,
-                                const mre_extra *extra)
+/*
+ * Render one record into `buf` (no trailing newline) and return its length.
+ * This is the single source of truth for the line format: the extension's
+ * own writer appends the result, and the async log script receives exactly
+ * the same bytes in $context['line'] - the two paths can never drift.
+ */
+size_t mre_log_format_line(char *buf, size_t cap,
+                           const char *type, const char *dir,
+                           const char *content, size_t content_len,
+                           const mre_extra *extra)
 {
-	char line[MRE_LOG_LINE_MAX];
 	char esc[MRE_JSON_VAL_MAX];
 	char tsbuf[40];
 	size_t len = 0;
-	FILE *fp;
 
-	fp = mre_log_target(target);
-	if (!fp) {
-		return; /* open failure was already reported once */
+	if (cap == 0) {
+		return 0; /* cannot even NUL-terminate */
+	}
+
+	/* config might not be resolved yet (e.g. MINIT time) - resolve lazily */
+	if (!MRE_G(cfg_valid)) {
+		mre_config_refresh();
 	}
 
 	mre_iso8601_now(tsbuf, sizeof(tsbuf));
@@ -428,26 +435,45 @@ static void mre_log_emit_record(const char *target,
 		mre_json_escape(content, content_len, esc, sizeof(esc));
 
 		/* request_id is generated internally ("[0-9-]" only): no escape */
-		mre_lbuf_appendf(line, sizeof(line), &len,
+		mre_lbuf_appendf(buf, cap, &len,
 			"{\"time\":\"%s\",\"pid\":%d,\"request_id\":\"%s\",\"type\":\"%s\",\"dir\":\"%s\",\"content\":\"%s\"",
 			tsbuf, (int)getpid(), mre_request_id_get(), typebuf, dirbuf, esc);
-		mre_lbuf_appendf(line, sizeof(line), &len, ",");
-		mre_log_extra_json(line, sizeof(line), &len, extra, esc);
-		mre_lbuf_appendf(line, sizeof(line), &len, "}");
+		mre_lbuf_appendf(buf, cap, &len, ",");
+		mre_log_extra_json(buf, cap, &len, extra, esc);
+		mre_lbuf_appendf(buf, cap, &len, "}");
 	} else {
 		mre_json_escape(content, content_len, esc, sizeof(esc));
-		mre_lbuf_appendf(line, sizeof(line), &len,
+		mre_lbuf_appendf(buf, cap, &len,
 			"%s pid=%d request_id=%s type=%s dir=%s content=\"%s\"",
 			tsbuf, (int)getpid(), mre_request_id_get(),
 			type ? type : "", dir ? dir : "", esc);
-		mre_log_extra_text(line, sizeof(line), &len, extra);
+		mre_log_extra_text(buf, cap, &len, extra);
 	}
 
-	if (len >= sizeof(line)) {
-		len = sizeof(line) - 1;
+	if (len >= cap) {
+		len = cap - 1;
 	}
-	line[len] = '\0';
+	buf[len] = '\0';
+	return len;
+}
 
+/* core emitter: format one record and append it to `target` */
+static void mre_log_emit_record(const char *target,
+                                const char *type, const char *dir,
+                                const char *content, size_t content_len,
+                                const mre_extra *extra)
+{
+	char line[MRE_LOG_LINE_MAX];
+	size_t len;
+	FILE *fp;
+
+	fp = mre_log_target(target);
+	if (!fp) {
+		return; /* open failure was already reported once */
+	}
+
+	len = mre_log_format_line(line, sizeof(line), type, dir,
+		content, content_len, extra);
 	mre_log_emit(fp, line, len);
 }
 
@@ -470,6 +496,18 @@ void mre_log_write(const char *type, const char *dir,
 #ifdef MRE_DBG_NOLOG
 	return;
 #endif
+
+	/*
+	 * Async log script wins over every synchronous resolver: when it is
+	 * configured the extension writes NOTHING itself (no sync script, no
+	 * yaml rules, no main log) - each record is handed to a forked child
+	 * which runs the script; the script appends $context['line'] itself.
+	 * Only mre.log_script_async decides this, mre.log_script is ignored.
+	 */
+	if (cfg->log_script_async[0] != '\0') {
+		mre_async_write(type, dir, content, content_len, extra);
+		return;
+	}
 
 	/* stage B: pick the destination for this record.  Priority:
 	 * log_script return value > yaml rule > mre.log_file */

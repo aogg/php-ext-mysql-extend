@@ -26,6 +26,11 @@
  * 环境变量覆盖（MRE_OO_*）。完整参数表见 docs/mre_oo_log_script.md。
  *
  * 运行环境：PHP 7.4（mre 扩展的 log_script 在同一请求进程内被 include）。
+ *
+ * 异步模式（mre.log_script_async / MRE_LOG_SCRIPT_ASYNC）：
+ *   扩展不再落盘、并 fork 子进程执行本脚本。被 include 的 mre_log_router.php 检测到
+ *   $context['line'] 后会自行 flock+fwrite，本地日志行为不变；本文件的推送逻辑不变，
+ *   只是现在跑在子进程里，不再占用业务请求时间（$context['line'] 原样随推送记录带上）。
  */
 
 /* ====================================================================

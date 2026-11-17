@@ -69,6 +69,7 @@ PHP_INI_BEGIN()
 	PHP_INI_ENTRY("mre.log_file",      "",     PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.log_format",    "json", PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.log_script",    "",     PHP_INI_ALL, NULL)
+	PHP_INI_ENTRY("mre.log_script_async", "",  PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.capture_mysql", "1",    PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.capture_redis", "1",    PHP_INI_ALL, NULL)
 	PHP_INI_ENTRY("mre.redis_port",    "6379", PHP_INI_ALL, NULL)
@@ -179,6 +180,8 @@ PHP_MINFO_FUNCTION(mre)
 	mre_info_value_row("state_dir (MRE_STATE_DIR)", cfg->state_dir);
 	mre_info_value_row("yaml_config (MRE_YAML_CONFIG)", cfg->yaml_config);
 	mre_info_value_row("log_script (MRE_LOG_SCRIPT)", cfg->log_script);
+	mre_info_value_row("log_script_async (MRE_LOG_SCRIPT_ASYNC)",
+		cfg->log_script_async);
 	{
 		char gtxbuf[32];
 		snprintf(gtxbuf, sizeof(gtxbuf), "%d", cfg->gtx_timeout);

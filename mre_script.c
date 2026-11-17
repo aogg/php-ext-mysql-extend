@@ -296,13 +296,9 @@ static void mre_ctx_entry_script(zval *out)
 /* ------------------------------------------------------------------ */
 /* record context passed down to the builder                            */
 /* ------------------------------------------------------------------ */
-typedef struct {
-	const char      *type;
-	const char      *dir;
-	const char      *content;
-	size_t           content_len;
-	const mre_extra *extra;
-} mre_script_ctxinfo;
+/* mre_script_ctxinfo lives in php_mre.h: the asynchronous path fills the
+ * same struct plus the pre-rendered line/format, so both callers go
+ * through one $context builder below. */
 
 /* extra[]: row counts / error info for the script */
 static void mre_ctx_extra(const mre_script_ctxinfo *ci, zval *out)
@@ -437,7 +433,18 @@ static zend_bool mre_call_simple(const char *fn, size_t fn_len)
 	return (zend_bool)1;
 }
 
-static void mre_ctx_build(zval *ctx, const mre_script_ctxinfo *ci)
+/*
+ * Build the $context array offered to a log script.  ONE builder for the
+ * synchronous and the asynchronous path (no duplicated field logic); the
+ * async caller passes ci->line so `line`/`format` are appended on top of
+ * the shared fields:
+ *   - line:   the exact bytes the extension would have appended (json or
+ *             text, no trailing newline) - the script just appends it;
+ *   - format: "json" or "text".
+ * On the sync path ci->line is NULL and those two keys stay absent, so the
+ * long-standing sync contract is unchanged.
+ */
+void mre_script_context_build(zval *ctx, const mre_script_ctxinfo *ci)
 {
 	zval tmp;
 
@@ -481,6 +488,14 @@ static void mre_ctx_build(zval *ctx, const mre_script_ctxinfo *ci)
 	/* entry script path, so a router script can identify the project */
 	mre_ctx_entry_script(&tmp);
 	add_assoc_zval_ex(ctx, "script", sizeof("script") - 1, &tmp);
+
+	/* async only: the already rendered line + its format */
+	if (ci->line != NULL) {
+		add_assoc_stringl_ex(ctx, "line", sizeof("line") - 1,
+			ci->line, ci->line_len);
+		add_assoc_string_ex(ctx, "format", sizeof("format") - 1,
+			ci->format ? ci->format : "json");
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -496,7 +511,7 @@ static void mre_script_globals_cleanup(void)
 }
 
 static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
-                                char *out, size_t cap)
+                                char *out, size_t cap, zend_bool quiet)
 {
 	zend_execute_data *prev_ed;
 	zend_object *pending;
@@ -535,7 +550,7 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
 	EG(current_execute_data) = NULL;
 
 	/* expose $context and the script path (and only those) in globals */
-	mre_ctx_build(&ctx, ci);
+	mre_script_context_build(&ctx, ci);
 	ZVAL_STRING(&pathv, path);
 	zend_hash_str_update(&EG(symbol_table), "context", 7, &ctx);
 	zend_hash_str_update(&EG(symbol_table), "___mre_path", 11, &pathv);
@@ -551,7 +566,9 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
 			EG(current_execute_data) = prev_ed;
 			EG(exception) = pending;
 			mre_script_globals_cleanup();
-			mre_script_warn(path, "wrapper compile failed");
+			if (!quiet) {
+				mre_script_warn(path, "wrapper compile failed");
+			}
 			return (zend_bool)0;
 		}
 	} zend_catch {
@@ -595,7 +612,7 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
 
 	/* $___mre_warn: set by the wrapper's catch (message summary) */
 	warn = zend_hash_str_find(&EG(symbol_table), "___mre_warn", 11);
-	if (warn && Z_TYPE_P(warn) == IS_STRING && Z_STRLEN_P(warn) > 0) {
+	if (!quiet && warn && Z_TYPE_P(warn) == IS_STRING && Z_STRLEN_P(warn) > 0) {
 		mre_script_warn(path, Z_STRVAL_P(warn));
 	}
 
@@ -614,6 +631,32 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
 }
 
 /* ------------------------------------------------------------------ */
+/* public: shared execution (sync + async)                              */
+/* ------------------------------------------------------------------ */
+/*
+ * Inject $context, run the fixed include wrapper and read the result back.
+ * Both the synchronous route and the forked async child call this - the
+ * "echo capture" belongs to the shared execution contract, so the async
+ * child suppresses script output exactly like the sync path does.
+ */
+zend_bool mre_script_execute(const char *path, const mre_script_ctxinfo *ci,
+                             char *out, size_t cap, zend_bool quiet)
+{
+	zend_bool ob_on, ok;
+
+	if (!EG(active)) {
+		return (zend_bool)0;
+	}
+
+	ob_on = mre_call_simple("ob_start", 8);
+	ok = mre_script_run(path, ci, out, cap, quiet);
+	if (ob_on) {
+		mre_call_simple("ob_end_clean", 12);
+	}
+	return ok;
+}
+
+/* ------------------------------------------------------------------ */
 /* public: try to resolve the target through the script                 */
 /* ------------------------------------------------------------------ */
 zend_bool mre_script_route(const char *type, const char *dir,
@@ -624,7 +667,7 @@ zend_bool mre_script_route(const char *type, const char *dir,
 	const mre_config *cfg;
 	struct stat st;
 	mre_script_ctxinfo ci;
-	zend_bool ob_on, ok;
+	zend_bool ok;
 
 	if (!MRE_G(cfg_valid)) {
 		mre_config_refresh();
@@ -650,13 +693,13 @@ zend_bool mre_script_route(const char *type, const char *dir,
 	ci.content = content;
 	ci.content_len = content_len;
 	ci.extra = extra;
+	/* synchronous path: no line/format keys in $context (contract kept) */
+	ci.line = NULL;
+	ci.line_len = 0;
+	ci.format = NULL;
 
 	MRE_G(script_busy) = (zend_bool)1;
-	ob_on = mre_call_simple("ob_start", 8);
-	ok = mre_script_run(cfg->log_script, &ci, out, cap);
-	if (ob_on) {
-		mre_call_simple("ob_end_clean", 12);
-	}
+	ok = mre_script_execute(cfg->log_script, &ci, out, cap, (zend_bool)0);
 	MRE_G(script_busy) = (zend_bool)0;
 
 	return ok;

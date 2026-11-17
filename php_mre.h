@@ -92,6 +92,7 @@ typedef struct {
 	int       gtx_timeout;                         /* MRE_GTX_TIMEOUT  */
 	char      log_file[MRE_PATH_MAX];              /* MRE_LOG_FILE     */
 	char      log_script[MRE_PATH_MAX];            /* MRE_LOG_SCRIPT   */
+	char      log_script_async[MRE_PATH_MAX];      /* MRE_LOG_SCRIPT_ASYNC */
 	char      state_dir[MRE_PATH_MAX];             /* MRE_STATE_DIR    */
 	char      yaml_config[MRE_PATH_MAX];           /* MRE_YAML_CONFIG  */
 } mre_config;
@@ -177,6 +178,18 @@ void mre_log_write_main(const char *type, const char *content);
                     /* un-routed record to the main log (warnings) */
 void mre_log_close(void);           /* MSHUTDOWN / GSHUTDOWN */
 
+/*
+ * Render one record into buf as the exact line the extension would append
+ * (json or text, no trailing newline); returns the byte length and always
+ * NUL-terminates.  Shared by the extension's own writer and by the async
+ * path, which hands this pre-rendered line to the script so both formats
+ * can never drift apart.
+ */
+size_t mre_log_format_line(char *buf, size_t cap,
+                           const char *type, const char *dir,
+                           const char *content, size_t content_len,
+                           const mre_extra *extra);
+
 /* ------------------------------------------------------------------ */
 /* Mini YAML parser (mre_yaml.c) - built-in, no libyaml                */
 /* Supports: nested maps, "- " lists, plain/quoted scalars, comments,  */
@@ -230,12 +243,58 @@ zend_bool mre_rules_dump_to_zval(zval *rules_out, zval *default_out);
 /* Runs mre.log_script per record; its `return 'path';` selects the     */
 /* log file. Any failure degrades to the caller's fallback.             */
 /* ------------------------------------------------------------------ */
+
+/*
+ * One log record as offered to a log script.  The synchronous path fills
+ * the first five fields; the asynchronous path additionally passes the
+ * already rendered line and its format, so the script can append that
+ * line verbatim (zero format drift between sync and async logs).
+ */
+typedef struct {
+	const char      *type;
+	const char      *dir;
+	const char      *content;
+	size_t           content_len;
+	const mre_extra *extra;
+	/* async only (NULL / ignored on the synchronous path) */
+	const char      *line;      /* rendered line, no trailing newline */
+	size_t           line_len;
+	const char      *format;    /* "json" or "text"                  */
+} mre_script_ctxinfo;
+
 void mre_script_rinit(void);       /* per request: enable + drop cache  */
 void mre_script_rshutdown(void);   /* disable until the next request    */
 zend_bool mre_script_route(const char *type, const char *dir,
                            const char *content, size_t content_len,
                            const mre_extra *extra,
                            char *out, size_t cap);
+
+/* shared by the sync and async paths (one $context builder, no copies) */
+void mre_script_context_build(zval *ctx, const mre_script_ctxinfo *ci);
+
+/*
+ * Shared execution: inject $context, run the fixed try/include wrapper
+ * through zend_eval_stringl, capture echo, read the result back.
+ * quiet=1 suppresses every degradation warning - used by the forked child,
+ * where writing the parent's main log is neither meaningful nor wanted.
+ */
+zend_bool mre_script_execute(const char *path, const mre_script_ctxinfo *ci,
+                             char *out, size_t cap, zend_bool quiet);
+
+/* ------------------------------------------------------------------ */
+/* Async log script (mre_async.c): one forked child per record          */
+/* ------------------------------------------------------------------ */
+/*
+ * Hand one record to mre.log_script_async without blocking the request:
+ * the line is rendered in the request process, then a child is forked and
+ * the parent returns immediately.  When the async path cannot run (ZTS
+ * build, fork failure, executor already shut down) the record is dropped
+ * with a once-per-process warning - there is deliberately no fallback to
+ * the sync script or the main log.
+ */
+void mre_async_write(const char *type, const char *dir,
+                     const char *content, size_t content_len,
+                     const mre_extra *extra);
 
 /* ------------------------------------------------------------------ */
 /* Cross-fpm global transaction (mre_gtx.c) - stage B                   */
@@ -344,6 +403,7 @@ ZEND_BEGIN_MODULE_GLOBALS(mre)
 	zend_bool      script_available;/* 1 between RINIT and RSHUTDOWN     */
 	zend_bool      script_warned;   /* one-time degradation warning      */
 	zend_bool      script_busy;     /* re-entrancy guard                 */
+	zend_bool      script_async_warned; /* one-time async-drop warning   */
 
 	/* global transaction (mre_gtx.c) */
 	int            gtx_epoch;       /* bumped per request                */
