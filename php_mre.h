@@ -55,6 +55,7 @@
 /* ------------------------------------------------------------------ */
 #define MRE_PATH_MAX        1024  /* config path values                */
 #define MRE_REQUEST_ID_MAX  64    /* "<pid>-<seq>", incl. NUL          */
+#define MRE_SCRIPT_WARN_MAX 256   /* script failure summary buffer     */
 #define MRE_LOG_LINE_MAX    16384 /* one log line, stack allocated     */
 #define MRE_JSON_VAL_MAX    8192  /* escaped content cap inside a line */
 #define MRE_EXTRA_KV_MAX    12    /* max extra key/value pairs         */
@@ -277,9 +278,14 @@ void mre_script_context_build(zval *ctx, const mre_script_ctxinfo *ci);
  * through zend_eval_stringl, capture echo, read the result back.
  * quiet=1 suppresses every degradation warning - used by the forked child,
  * where writing the parent's main log is neither meaningful nor wanted.
+ * warn/warn_cap (may be NULL/0) receives a short failure summary: "" on
+ * success, the throwable message / "wrapper compile failed" otherwise.  The
+ * async child turns that summary into one throttled stderr line, so a broken
+ * script is not completely silent.
  */
 zend_bool mre_script_execute(const char *path, const mre_script_ctxinfo *ci,
-                             char *out, size_t cap, zend_bool quiet);
+                             char *out, size_t cap, zend_bool quiet,
+                             char *warn, size_t warn_cap);
 
 /* ------------------------------------------------------------------ */
 /* Async log script (mre_async.c): one forked child per record          */

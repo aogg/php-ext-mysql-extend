@@ -21,7 +21,12 @@
   |   - only _exit() may end the child: no exit(), no zend_bailout()    |
   |     escaping into the copied request frames, no RSHUTDOWN, no        |
   |     atexit/destructor run, no fflush of the parent's stdio buffers;  |
-  |   - no waitpid()/SIGCHLD changes here (fpm owns those semantics);    |
+  |   - SIGCHLD semantics stay untouched; waitpid(-1, ...) is never used |
+  |     (it would steal proc_open()/exec() children): the parent reaps   |
+  |     only the pids it recorded, with WNOHANG, while handling later    |
+  |     records;                                                         |
+  |   - a failed script execution in the grandchild prints one throttled |
+  |     stderr line instead of writing the main log;                     |
   |   - every Zend allocation the script makes dies with _exit() - the  |
   |     child never returns into the request that forked it;             |
   |   - a bailout raised by the script (exit()/fatal) is caught by the   |
@@ -92,8 +97,137 @@ void mre_async_write(const char *type, const char *dir,
 #else /* !PHP_WIN32 */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+/* ------------------------------------------------------------------ */
+/* first-layer child reaping (bounds the zombie population)             */
+/* ------------------------------------------------------------------ */
+/*
+ * Every record forks a first-layer child that leaves at once.  Nobody
+ * waits for it, so each exit stays a zombie under the fpm worker forever
+ * (the "short zombie" once assumed here does not exist - a zombie lives
+ * until somebody wait()s or the worker dies).  At high rates the process
+ * table fills, fork() starts failing with EAGAIN and every record is
+ * dropped.
+ *
+ * SIGCHLD handling is not ours to change and the request must not block,
+ * so the only safe design is opportunistic reaping: remember OUR OWN
+ * first-layer pids and try waitpid(<that pid>, WNOHANG) on later records.
+ * waitpid(-1, ...) is forbidden - it would reap the business code's
+ * proc_open()/exec() children.
+ *
+ * In the steady state the array holds 0..1 live entries, so a record pays
+ * at most one extra waitpid() syscall.
+ */
+#define MRE_ASYNC_CHILD_SLOTS 32
+
+static pid_t mre_async_child_pids[MRE_ASYNC_CHILD_SLOTS];
+static int   mre_async_child_count;
+
+/* request process only - never executed by a forked child */
+static void mre_async_reap_children(void)
+{
+	int i = 0;
+
+	while (i < mre_async_child_count) {
+		pid_t r = waitpid(mre_async_child_pids[i], NULL, WNOHANG);
+
+		if (r == mre_async_child_pids[i] || (r < 0 && errno == ECHILD)) {
+			/*
+			 * Reaped now, or no longer our child (already reaped
+			 * elsewhere): drop the slot and compress the array by
+			 * moving the last entry into it, then recheck that entry.
+			 */
+			mre_async_child_count--;
+			mre_async_child_pids[i] =
+				mre_async_child_pids[mre_async_child_count];
+			continue;
+		}
+		/* 0: still running; transient error: keep for the next record */
+		i++;
+	}
+}
+
+static void mre_async_track_child(pid_t pid)
+{
+	if (mre_async_child_count < MRE_ASYNC_CHILD_SLOTS) {
+		mre_async_child_pids[mre_async_child_count++] = pid;
+		return;
+	}
+	/*
+	 * Array full: more than 32 first-layer children forked since the last
+	 * opportunistic reap (a transient burst).  Overwrite the OLDEST entry,
+	 * i.e. that one may keep its zombie: the leak is bounded by one per
+	 * burst and needs extreme pressure to happen at all - accepted, a
+	 * dropped slot must never turn into an unbounded array or a blocking
+	 * wait.
+	 */
+	memmove(&mre_async_child_pids[0], &mre_async_child_pids[1],
+		sizeof(pid_t) * (MRE_ASYNC_CHILD_SLOTS - 1));
+	mre_async_child_pids[MRE_ASYNC_CHILD_SLOTS - 1] = pid;
+}
+
+/* ------------------------------------------------------------------ */
+/* failure visibility: one throttled stderr line per worker             */
+/* ------------------------------------------------------------------ */
+/*
+ * The grandchild must not write the main log (the line would carry the
+ * child's pid and could recurse into the log script), so a failed script
+ * execution goes to stderr - fpm puts it into its error log.  One marker
+ * file per worker caps that at one line per 60 s:
+ *   /tmp/.mre-async-warn-<worker pid>
+ *
+ * The pid is the WORKER pid captured before fork(): in the grandchild
+ * getppid() is the already-exiting first-layer child (or 1), never the
+ * worker, so it cannot provide per-worker throttling.
+ */
+#define MRE_ASYNC_WARN_INTERVAL 60
+
+static void mre_async_report_failure(pid_t worker_pid, const char *path,
+                                     const char *summary)
+{
+	char marker[64];
+	char buf[MRE_PATH_MAX + 256];
+	struct stat st;
+	time_t now;
+	size_t len;
+	int n, fd;
+
+	snprintf(marker, sizeof(marker), "/tmp/.mre-async-warn-%ld",
+		(long)worker_pid);
+
+	now = time(NULL);
+	if (stat(marker, &st) == 0 && now != (time_t)-1
+			&& now - st.st_mtime <= MRE_ASYNC_WARN_INTERVAL) {
+		return; /* this worker already reported a failure recently */
+	}
+
+	n = snprintf(buf, sizeof(buf),
+		"[mre] async log_script '%s' failed (%s); record dropped\n",
+		path ? path : "", summary ? summary : "unknown failure");
+	if (n > 0) {
+		len = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
+		/* plain write(2): no stdio buffering, no FILE locks, no retry -
+		 * the record is already lost, a dead stderr must not hang us */
+		(void)write(STDERR_FILENO, buf, len);
+	}
+
+	/* create/refresh the marker: write() updates mtime, so the next
+	 * failure within the window above is suppressed */
+	fd = open(marker, O_WRONLY | O_CREAT, 0600);
+	if (fd >= 0) {
+		n = snprintf(buf, sizeof(buf), "%ld\n", (long)now);
+		if (n > 0) {
+			len = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
+			(void)write(fd, buf, len);
+		}
+		close(fd);
+	}
+}
 
 void mre_async_write(const char *type, const char *dir,
                      const char *content, size_t content_len,
@@ -104,7 +238,7 @@ void mre_async_write(const char *type, const char *dir,
 	char line[MRE_LOG_LINE_MAX];
 	size_t line_len;
 	struct stat st;
-	pid_t pid, pid2;
+	pid_t pid, pid2, worker_pid;
 
 	if (!MRE_G(cfg_valid)) {
 		mre_config_refresh();
@@ -164,9 +298,21 @@ void mre_async_write(const char *type, const char *dir,
 	ci.line_len = line_len;
 	ci.format = cfg->json_format ? "json" : "text";
 
+	/*
+	 * Opportunistic reaping before forking the next child: at most one
+	 * waitpid() in the steady state, never blocking, and only for pids
+	 * this extension recorded itself.
+	 */
+	mre_async_reap_children();
+
+	/* the marker file for throttled failure reports is per worker */
+	worker_pid = getpid();
+
 	pid = fork();
 	if (pid > 0) {
-		return; /* parent: zero wait - the child owns the record now */
+		/* parent: remember our own child so a later record can reap it */
+		mre_async_track_child(pid);
+		return; /* zero wait - the child owns the record now */
 	}
 	if (pid < 0) {
 		mre_async_warn_once("fork() failed");
@@ -195,18 +341,29 @@ void mre_async_write(const char *type, const char *dir,
 		_exit(0); /* executor already gone in the copied state: silent */
 	}
 	if (stat(cfg->log_script_async, &st) != 0) {
-		_exit(0); /* missing script: silent (stat is per record) */
+		/* missing script: reported (throttled) instead of vanishing */
+		mre_async_report_failure(worker_pid, cfg->log_script_async,
+			"stat() failed");
+		_exit(0);
 	}
 
 	zend_try {
 		/*
-		 * quiet=1: a script failure is the script owner's business and
-		 * must not write into the parent's main log from a child (that
-		 * line would also carry the child's pid).  The return value is
-		 * ignored by contract - in async mode the script writes the
-		 * record itself, $context['line'] is already the final bytes.
+		 * quiet=1: a script failure must not write into the parent's
+		 * main log from a child (that line would also carry the child's
+		 * pid); the failure summary travels back through `warn` and is
+		 * printed to stderr instead (throttled per worker).  The return
+		 * value is ignored by contract - in async mode the script
+		 * writes the record itself, $context['line'] is already final.
 		 */
-		mre_script_execute(cfg->log_script_async, &ci, NULL, 0, (zend_bool)1);
+		char warn[MRE_SCRIPT_WARN_MAX];
+
+		if (mre_script_execute(cfg->log_script_async, &ci, NULL, 0,
+				(zend_bool)1, warn, sizeof(warn)) == (zend_bool)0
+				&& warn[0] != '\0') {
+			mre_async_report_failure(worker_pid,
+				cfg->log_script_async, warn);
+		}
 	} zend_catch {
 		/*
 		 * exit()/die()/fatal error inside the script raised a bailout in

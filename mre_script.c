@@ -99,6 +99,30 @@ static void mre_script_warn(const char *path, const char *summary)
 }
 
 /* ------------------------------------------------------------------ */
+/* failure summary handed back to the caller                            */
+/* ------------------------------------------------------------------ */
+/*
+ * The async child must know *that* and *why* the script failed without
+ * writing the parent's main log, so the failure travels back through a
+ * caller-provided buffer instead.  Truncation is deliberate: the summary
+ * ends up as one stderr line, not as a log message transcript.
+ */
+static void mre_script_set_warn(char *warn, size_t cap, const char *summary)
+{
+	size_t len;
+
+	if (warn == NULL || cap == 0) {
+		return; /* caller does not want failure details */
+	}
+	len = strlen(summary);
+	if (len >= cap) {
+		len = cap - 1;
+	}
+	memcpy(warn, summary, len);
+	warn[len] = '\0';
+}
+
+/* ------------------------------------------------------------------ */
 /* $context building                                                    */
 /* ------------------------------------------------------------------ */
 /* $_SERVER HTTP_* + CONTENT_TYPE/CONTENT_LENGTH -> header => value     */
@@ -511,11 +535,12 @@ static void mre_script_globals_cleanup(void)
 }
 
 static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
-                                char *out, size_t cap, zend_bool quiet)
+                                char *out, size_t cap, zend_bool quiet,
+                                char *warn, size_t warn_cap)
 {
 	zend_execute_data *prev_ed;
 	zend_object *pending;
-	zval ctx, pathv, *ret, *warn;
+	zval ctx, pathv, *ret, *warnv;
 	zend_bool routed = (zend_bool)0;
 
 	/*
@@ -566,6 +591,7 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
 			EG(current_execute_data) = prev_ed;
 			EG(exception) = pending;
 			mre_script_globals_cleanup();
+			mre_script_set_warn(warn, warn_cap, "wrapper compile failed");
 			if (!quiet) {
 				mre_script_warn(path, "wrapper compile failed");
 			}
@@ -610,10 +636,16 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
 	 * wrapper); keep whatever exception the interrupted code had pending */
 	EG(exception) = pending;
 
-	/* $___mre_warn: set by the wrapper's catch (message summary) */
-	warn = zend_hash_str_find(&EG(symbol_table), "___mre_warn", 11);
-	if (!quiet && warn && Z_TYPE_P(warn) == IS_STRING && Z_STRLEN_P(warn) > 0) {
-		mre_script_warn(path, Z_STRVAL_P(warn));
+	/* $___mre_warn: set by the wrapper's catch (message summary).  The
+	 * summary is always handed back to the caller (the async child prints
+	 * it to stderr); the main-log warning stays once-per-process and is
+	 * suppressed in the child (quiet=1). */
+	warnv = zend_hash_str_find(&EG(symbol_table), "___mre_warn", 11);
+	if (warnv && Z_TYPE_P(warnv) == IS_STRING && Z_STRLEN_P(warnv) > 0) {
+		mre_script_set_warn(warn, warn_cap, Z_STRVAL_P(warnv));
+		if (!quiet) {
+			mre_script_warn(path, Z_STRVAL_P(warnv));
+		}
 	}
 
 	/* $___mre_ret: the include's return value (the requested log path) */
@@ -640,16 +672,20 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
  * child suppresses script output exactly like the sync path does.
  */
 zend_bool mre_script_execute(const char *path, const mre_script_ctxinfo *ci,
-                             char *out, size_t cap, zend_bool quiet)
+                             char *out, size_t cap, zend_bool quiet,
+                             char *warn, size_t warn_cap)
 {
 	zend_bool ob_on, ok;
 
+	if (warn != NULL && warn_cap > 0) {
+		warn[0] = '\0'; /* "" == no failure (also when we return early) */
+	}
 	if (!EG(active)) {
 		return (zend_bool)0;
 	}
 
 	ob_on = mre_call_simple("ob_start", 8);
-	ok = mre_script_run(path, ci, out, cap, quiet);
+	ok = mre_script_run(path, ci, out, cap, quiet, warn, warn_cap);
 	if (ob_on) {
 		mre_call_simple("ob_end_clean", 12);
 	}
@@ -699,7 +735,8 @@ zend_bool mre_script_route(const char *type, const char *dir,
 	ci.format = NULL;
 
 	MRE_G(script_busy) = (zend_bool)1;
-	ok = mre_script_execute(cfg->log_script, &ci, out, cap, (zend_bool)0);
+	ok = mre_script_execute(cfg->log_script, &ci, out, cap, (zend_bool)0,
+		NULL, 0);
 	MRE_G(script_busy) = (zend_bool)0;
 
 	return ok;
