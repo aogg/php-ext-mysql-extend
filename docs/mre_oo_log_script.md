@@ -1,8 +1,9 @@
 # mre_oo_log_script.php —— 扩展日志脚本：本地路由 + OpenObserve 推送
 
 一句话：`scripts/mre_oo_log_script.php` 是 mre 扩展 `mre.log_script` 的增强版脚本 ——
-**本地日志照旧按 `mre_log_router.php` 落盘，同时把每条记录（补 `level`/`job`）推送到
-OpenObserve 风格写入接口**。任何推送失败都静默降级，绝不影响本地日志与业务请求。
+**本地日志照旧按 `mre_log_router.php` 落盘，同时把每条记录（补 `level`/`job` 与请求上下文
+`http_host`/`http_path`/`http_scheme`/`http_ip`）推送到 OpenObserve 风格写入接口**。
+任何推送失败都静默降级，绝不影响本地日志与业务请求。
 
 - 运行环境：PHP 7.4（扩展在同一请求进程中 include 本脚本）；有 curl 扩展走 curl，
   没有则回退 `stream_context_create`（`Authorization: Basic` 手动拼头）。
@@ -47,24 +48,45 @@ yaml 规则 / `mre.log_file`。
 
 推送的记录 = `$context` 原样复制（`type`/`dir`/`content`/`extra`/`headers`/`post`/
 `cookie`/`get`/`session_id`/`uri`/`method`/`pid`/`request_id`/`script` 等字段全部保留）
-**再补两个字段**：
+**再补 2 个基础字段**：
 
 | 字段 | 来源 | 规则 |
 |---|---|---|
 | `level` | `$context['type']` | `type == "warn"` → `warn`，否则 `info`；`$context` 里已有非空 `level` 时不覆盖 |
 | `job` | 路由返回的**本地日志路径** basename | 依次去掉 `.query.log` / `.write.log` / `.redis.log` / `.log`（**长后缀优先**）；路径为 `null`（如 warn 记录、路由降级）时用 `mre`；已有非空 `job` 时不覆盖 |
 
-示例（`/api/user/list` 的 SELECT 记录）：
+**以及 4 个请求上下文字段**（模拟 access log，方便按 host/路径/客户端 IP 检索；
+全部**只在值非空时添加**，CLI/脚本任务下自然省略，不产生 `"http_host":""` 这类空噪声）：
+
+| 字段 | 来源 | 规则 |
+|---|---|---|
+| `http_host` | `$_SERVER['HTTP_HOST']`，为空回退 `$_SERVER['SERVER_NAME']` | 原样保留 `host:port`（端口不剥）；两者都空 → 不加 |
+| `http_path` | `$context['uri']`（为空回退 `$_SERVER['REQUEST_URI']`） | `parse_url(..., PHP_URL_PATH)` 取 path 部分，**不带 query**；解析失败或 path 为空 → 不加 |
+| `http_scheme` | `$_SERVER['HTTPS']` / `$_SERVER['REQUEST_SCHEME']` | `HTTPS` 非空且不是 `off`（大小写不敏感）→ `https`；否则 `REQUEST_SCHEME` 非空 → 其小写；否则 `http`。仅在能判定是 HTTP 请求（`http_host` 或 `uri` 非空）时加 |
+| `http_ip` | `$_SERVER['REMOTE_ADDR']` | 直连客户端地址；为空 → 不加（不猜 `X-Forwarded-For`） |
+
+原有 `uri`（完整请求 URI，含 query）/`method`/`script` 等字段**仍原样保留**，
+`http_path` 只是在其基础上额外给出的纯路径，便于按路径聚合。
+
+示例（`/api/user/list` 的 SELECT 记录，HTTP 请求）：
 
 ```json
 {
   "type": "mysql", "dir": "req", "content": "SELECT 1",
   "extra": {"cmd": "query", "rows": 1},
   "pid": 4242, "request_id": "4242-1",
+  "uri": "/api/user/list?page=1", "method": "GET",
   "script": "/opt/app/public/index.php",
+  "http_host": "zuodian.test:8080",
+  "http_path": "/api/user/list",
+  "http_scheme": "https",
+  "http_ip": "10.0.0.9",
   "level": "info", "job": "api-user-list"
 }
 ```
+
+> CLI 场景（无 `$_SERVER` 请求键，如定时任务跑 SQL）：`http_host`/`http_path`/
+> `http_scheme`/`http_ip` 四个字段**都不出现**，记录与之前完全一致。
 
 `job` 与本地日志文件名一一对应：`api-user-list.query.log` → `job=api-user-list`，
 `cli.redis.log` → `job=cli`；路由降级（`mre.log_file`）→ `job=mre`。

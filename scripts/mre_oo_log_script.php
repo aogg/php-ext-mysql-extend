@@ -348,7 +348,20 @@ if (!function_exists('mre_oo_job_from_path')) {
 }
 
 /**
- * 加工一条推送记录：$context 原样复制 + 补 level / job（已有值不覆盖）。
+ * 加工一条推送记录：$context 原样复制 + 补 level / job + 请求上下文四个字段。
+ *
+ * level / job：派生规则见下，只补缺失值，$context 已有的非空值不覆盖。
+ *
+ * 请求上下文（模拟 nginx access log，方便按 host/路径/IP 检索）：
+ *   - http_host：`$_SERVER['HTTP_HOST']`（原样保留端口），为空回退 `SERVER_NAME`；
+ *   - http_path：`$context['uri']`（为空回退 `$_SERVER['REQUEST_URI']`）的 path 部分，
+ *     用 `parse_url(..., PHP_URL_PATH)` 取，**不含 query**；
+ *   - http_scheme：`HTTPS` 非空且不是 `off`（大小写不敏感）→ `https`；否则
+ *     `REQUEST_SCHEME` 非空 → 其小写；否则 `http`（仅在判定为 HTTP 请求时才补）；
+ *   - http_ip：`$_SERVER['REMOTE_ADDR']`。
+ * 四个字段**只在值非空时添加**：CLI/脚本任务没有这些 $_SERVER 键，加空串只会污染
+ * 记录（`"http_host":""`）并让检索出现无意义的空值分组，所以干脆省略。
+ * `$_SERVER` 可能不存在/不是数组、各值也可能不是字符串，全部防御式读取。
  *
  * @param array      $context 扩展注入的记录上下文
  * @param mixed      $path    路由脚本返回的本地日志路径（string 或 null）
@@ -370,6 +383,72 @@ if (!function_exists('mre_oo_record')) {
         $job = isset($record['job']) ? $record['job'] : null;
         if (!is_scalar($job) || (string) $job === '') {
             $record['job'] = mre_oo_job_from_path($path);
+        }
+
+        // $_SERVER 在 CLI/异常 SAPI 下可能不存在或不是数组，先归一成数组
+        $server = (isset($_SERVER) && is_array($_SERVER)) ? $_SERVER : array();
+
+        // http_host：HTTP_HOST 优先（原样保留 host:port），为空回退 SERVER_NAME
+        $host = '';
+        foreach (array('HTTP_HOST', 'SERVER_NAME') as $host_key) {
+            if (!isset($server[$host_key]) || !is_scalar($server[$host_key])) {
+                continue;
+            }
+            $host_value = trim((string) $server[$host_key]);
+            if ($host_value !== '') {
+                $host = $host_value;
+                break;
+            }
+        }
+        if ($host !== '') {
+            $record['http_host'] = $host;
+        }
+
+        // 路径的原料：$context['uri'] 优先（扩展已提取），为空回退 REQUEST_URI
+        $uri = '';
+        if (isset($record['uri']) && is_scalar($record['uri'])) {
+            $uri = trim((string) $record['uri']);
+        }
+        if ($uri === '' && isset($server['REQUEST_URI']) && is_scalar($server['REQUEST_URI'])) {
+            $uri = trim((string) $server['REQUEST_URI']);
+        }
+
+        // http_path：只取 path，query 丢掉；parse_url 失败（false）或 path 为空则不加
+        if ($uri !== '') {
+            $path_part = @parse_url($uri, PHP_URL_PATH);
+            if (is_string($path_part) && $path_part !== '') {
+                $record['http_path'] = $path_part;
+            }
+        }
+
+        // http_scheme：只有能判定是 HTTP 请求（有 host 或 uri）时才补，CLI 下保持省略
+        if ($host !== '' || $uri !== '') {
+            $https = '';
+            if (isset($server['HTTPS']) && is_scalar($server['HTTPS'])) {
+                $https = strtolower(trim((string) $server['HTTPS']));
+            }
+            // REQUEST_SCHEME 允许为空/非字符串：此时退回默认 http
+            $request_scheme = '';
+            if (isset($server['REQUEST_SCHEME']) && is_scalar($server['REQUEST_SCHEME'])) {
+                $request_scheme = strtolower(trim((string) $server['REQUEST_SCHEME']));
+            }
+            if ($https !== '' && $https !== 'off') {
+                // PHP 在 HTTPS 下通常给 "on"/"1"；非空且不是 off 一律按 https
+                $scheme = 'https';
+            } elseif ($request_scheme !== '') {
+                $scheme = $request_scheme;
+            } else {
+                $scheme = 'http';
+            }
+            $record['http_scheme'] = $scheme;
+        }
+
+        // http_ip：直连客户端地址；取不到（CLI）就不加，不猜 X-Forwarded-For
+        if (isset($server['REMOTE_ADDR']) && is_scalar($server['REMOTE_ADDR'])) {
+            $ip = trim((string) $server['REMOTE_ADDR']);
+            if ($ip !== '') {
+                $record['http_ip'] = $ip;
+            }
         }
 
         return $record;
