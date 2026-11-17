@@ -86,7 +86,7 @@ yaml 规则 / `mre.log_file`。
 | `stream` | `MRE_OO_STREAM` | `default` | 流名；规则同上 |
 | `user` | `MRE_OO_USER` | 无（空） | HTTP Basic 用户名；为空 = 不推送（`no_user`） |
 | `pass` | `MRE_OO_PASS` | 无（空） | HTTP Basic 密码；为空 = 不推送（`no_pass`）；任何输出/debug 都不回显 |
-| `timeout` | `MRE_OO_TIMEOUT` | `2` | 单次请求总超时（秒，1~30），同时作为 connect timeout 的上限 |
+| `timeout` | `MRE_OO_TIMEOUT` | `5` | 单次请求总超时（秒，1~30，默认 5），同时作为 connect timeout 的上限 |
 | `insecure` | `MRE_OO_INSECURE` | `1` | `1` = 跳过 TLS 证书校验（等价 `curl -k`：`CURLOPT_SSL_VERIFYPEER=false` + `VERIFYHOST=0`；stream 分支对应 `verify_peer/verify_peer_name=false`）；`0` = 正常校验 |
 | `batch` | `MRE_OO_BATCH` | `1` | `1` = 请求内累积、shutdown 时合并发送；`0` = 每条记录即时单条 POST |
 | `debug` | `MRE_OO_DEBUG` | `0` | `1` = 把推送结果/跳过原因写进 `debug_file`（一行一个 JSON，**不含密码**） |
@@ -105,7 +105,7 @@ yaml 规则 / `mre.log_file`。
   "stream": "default",
   "user": "your-user",
   "pass": "your-pass",
-  "timeout": 2,
+  "timeout": 5,
   "insecure": 1,
   "batch": 1,
   "debug": 0,
@@ -124,7 +124,7 @@ MRE_OO_ORG=default
 MRE_OO_STREAM=default
 MRE_OO_USER=your-user
 MRE_OO_PASS=your-pass
-MRE_OO_TIMEOUT=2
+MRE_OO_TIMEOUT=5
 MRE_OO_INSECURE=1
 MRE_OO_BATCH=1
 MRE_OO_DEBUG=0
@@ -201,7 +201,7 @@ php -d xdebug.mode=off -l /opt/mre/scripts/mre_oo_log_script.php
 ### `max_buffer` 提前 flush
 
 缓冲达到 `max_buffer`（默认 1000 条）时立即发送一次，避免单个长请求把记录全攒在内存里。
-**注意这是一次请求内的同步 curl**：最坏情况会阻塞当前请求 `timeout` 秒（默认 2 秒）。
+**注意这是一次请求内的同步 curl**：最坏情况会阻塞当前请求 `timeout` 秒（默认 5 秒）。
 因此 `max_buffer` 不要设得太小（设成 1 等于退化成逐条同步发送）。
 
 ### `batch=0`：每条即时单条发送
@@ -229,9 +229,10 @@ php -d xdebug.mode=off -l /opt/mre/scripts/mre_oo_log_script.php
 ## 六、注意与限制
 
 - **超时后 worker 占用**：`batch=0` 或 `max_buffer` 提前 flush 时，丢包/服务不可达会让当前
-  PHP worker 最多阻塞 `timeout` 秒（默认 2 秒；会占用该请求的 fpm worker）。shutdown flush
+  PHP worker 最多阻塞 `timeout` 秒（默认 5 秒；会占用该请求的 fpm worker）。shutdown flush
   在 `fastcgi_finish_request()` 之后，阻塞的是 worker 而不是客户端。生产建议
-  `timeout` ≤ 2、`max_buffer` 保持默认量级。
+  `timeout` 用默认 5 秒、`max_buffer` 保持默认量级；冷启动/网络慢时整批会超时丢弃，
+  可按需调大 `timeout`（最大 30）。
 - **无幂等键 / 无重试**：接口没有幂等键，脚本也不重试。所以「发失败 = 丢这一批」，
   不会重复写入，也不会无限重试拖垮 worker。记录本身带 `pid` + `request_id`，可用于去重排查。
 - **本地日志不受影响**：推送链路完全独立于本地写日志。即使日志服务全挂、`user/pass` 配错、

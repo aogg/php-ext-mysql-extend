@@ -227,8 +227,8 @@ if (!function_exists('mre_oo_config')) {
             'user' => '',
             // HTTP Basic 密码；为空 = 不推送（任何输出都不回显）
             'pass' => '',
-            // 单次请求总超时（秒），同时作为 connect timeout 的上限
-            'timeout' => 2,
+            // 单次请求总超时（秒，默认 5，1~30），同时作为 connect timeout 的上限
+            'timeout' => 5,
             // 1 = 跳过 TLS 证书校验（相当于 curl -k）
             'insecure' => 1,
             // 1 = 请求内累积、shutdown 时合并发送；0 = 每条即时单发
@@ -293,7 +293,7 @@ if (!function_exists('mre_oo_config')) {
         $cfg['batch'] = mre_oo_bool($cfg['batch']);
         $cfg['debug'] = mre_oo_bool($cfg['debug']);
         // 超时限制在 1~30 秒：日志推送绝不能把 worker 占太久
-        $cfg['timeout'] = mre_oo_int($cfg['timeout'], 2, 1, 30);
+        $cfg['timeout'] = mre_oo_int($cfg['timeout'], 5, 1, 30);
         // 缓冲上限限制在 1~100000 条
         $cfg['max_buffer'] = mre_oo_int($cfg['max_buffer'], 1000, 1, 100000);
         $cfg['url'] = rtrim(trim(mre_oo_str($cfg['url'])), '/');
@@ -688,7 +688,7 @@ if (!function_exists('mre_oo_push')) {
             return false;
         }
         $start = microtime(true);
-        $timeout = mre_oo_int($cfg['timeout'], 2, 1, 30);
+        $timeout = mre_oo_int($cfg['timeout'], 5, 1, 30);
         if (function_exists('curl_init')) {
             $response = mre_oo_http_post_curl($endpoint, $body, $cfg, $timeout);
         } else {
