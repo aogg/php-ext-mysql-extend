@@ -221,6 +221,7 @@ return null;                              // null/空/非字符串 -> 降级到 
 - **扩展不写任何日志**：既不再写 `mre.log_file`，也不执行 `mre.log_script`、不跑 yaml 规则；每条记录只交给一个 fork 出来的子进程。
 - **请求零等待**：父进程 `fork()` 后立即返回；子进程再 fork 一次后退出，孙进程执行脚本（见 `docs/设计.md` §9）。
 - **脚本自己落盘**：`$context` 在同步字段之外额外提供 `line`（扩展已渲染好的整行，json 或 text，**不含结尾换行**）与 `format`（`json`/`text`）。脚本负责 `mkdir`（目录不存在时）、`flock(LOCK_EX)`、`fwrite($line."\n")`。因为 `line` 就是扩展原本会写出的字节，异步与同步的日志格式零漂移。
+- **日志目录要放本地文件系统**：异步是多子进程并发追加同一文件。实测（Docker Desktop for Windows）日志写到宿主 Windows 盘共享（容器 `/app/origin`，9p/drvfs）时 10 轮有 8 轮丢 0~4 行，写到容器 overlay（`/tmp`）则 10 轮 50/50 零丢失；扩展侧计数始终 50/50，丢在文件系统层 append。请写真实 Linux 盘 / 容器 overlay / 非网络共享卷，不要直接写 Docker Desktop 的 Windows 盘共享目录。详见 [docs/异步脚本.md](docs/异步脚本.md) §8。
 - **故障降级**：fork 失败或 ZTS 构建下**丢弃该条记录**并每进程告警一次，绝不回落同步、绝不阻塞请求；子进程内脚本 `stat` 失败/异常则静默结束该子进程（脚本自己的错误请写自己的错误日志）。
 - 仓库自带的 `scripts/mre_log_router.php`（以及 include 它的 `mre_oo_log_script.php`）**已内置自写模式**：检测到 `$context['line']` 就自行追加落盘，脚本文件不用改。迁移只需把 ini 里的 `mre.log_script` 换成 `mre.log_script_async`（路径不变），详见 [docs/异步脚本.md](docs/异步脚本.md)。
 
