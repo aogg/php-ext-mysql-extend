@@ -674,7 +674,8 @@ if (!function_exists('mre_oo_push')) {
             return false;
         }
         // 接口硬约束：body 必须是 JSON **数组**（JSON Lines 会 400），所以先合并再编码
-        $body = json_encode(array_values($records), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        // 记录里的 SQL/redis content 可能含非 UTF-8 字节，带 SUBSTITUTE 可把非法字节替换成 U+FFFD，避免单条坏字节导致整批丢弃
+        $body = json_encode(array_values($records), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
         if ($body === false) {
             mre_oo_debug('skip', array(
                 // 编码失败（常见原因：记录里含非法 UTF-8 字节）

@@ -243,6 +243,7 @@ php -d xdebug.mode=off -l /opt/mre/scripts/mre_oo_log_script.php
 - **密码安全**：只通过 `CURLOPT_USERPWD` / `Authorization` 头发送，不进 URL、不进 debug、
   不进异常信息；配置文件的权限请自行收紧（640）。
 - **单条记录的字段**：`extra` 等嵌套对象原样发（接口实测接受嵌套对象）；若 `$context` 含非法
-  UTF-8 字节（如二进制参数），`json_encode` 会失败 → 本条不推送并记 `skip/json_encode_failed`。
+  UTF-8 字节（如二进制参数），这些字节会被替换为 U+FFFD（`JSON_INVALID_UTF8_SUBSTITUTE`），
+  **不会导致整批丢弃**；其余编码错误仍会失败并记 `skip/json_encode_failed`。
 - **与 `scripts/oo_push.php` 的分工**：`oo_push.php` 是离线补发/批量导入的 CLI（可读历史日志文件
   重推）；本脚本是**在线**推送（扩展每条记录实时推）。两者复用同一套接口语义与 `level`/`job` 派生规则。
