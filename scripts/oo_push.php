@@ -963,7 +963,7 @@ if ($raw['log'] !== null) {
                 'level' => $level,                  // 日志级别
                 'job' => $job,                      // 任务名
                 'log' => $line,                     // 日志正文
-                'time' => date('Y-m-d H:i:s'),      // 采集时间（本地时区）
+                'time' => date('c'),                // 采集时间（ISO8601 带偏移，与 mre 日志 time 格式一致，带偏移避免跨时区误读）
             ),
             'srcJob' => '',                         // 合成记录自带 job，无需派生
         );

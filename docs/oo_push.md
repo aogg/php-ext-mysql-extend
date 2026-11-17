@@ -38,7 +38,7 @@ OpenObserve 风格的 `_json` 写入接口，只做写入、不做查询。
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `--log=TEXT` | string | 无 | 生成合成记录正文；生成条数由 `--count` 决定，多条时正文追加 ` #i`（i 从 1 起） |
+| `--log=TEXT` | string | 无 | 生成合成记录正文；生成条数由 `--count` 决定，多条时正文追加 ` #i`（i 从 1 起）。合成记录的 `time` 是 ISO8601 带时区偏移（如 `2026-11-17T10:50:04+08:00`），与 mre 日志 `time` 格式一致 |
 | `--level=LEVEL` | string | `info` | 合成记录的 `level` 字段 |
 | `--job=JOB` | string | `oo_push` | 合成记录的 `job` 字段；`--mre` 下也作为派生不出的 job 兜底 |
 | `--count=N` | int | `1` | 合成记录条数，必须 ≥ 1（仅配合 `--log` 生效） |
@@ -142,8 +142,8 @@ php scripts/oo_push.php \
 
 ```bash
 php scripts/oo_push.php --log='hello' --count=3 --batch=2 --dry-run
-# -> [{"level":"info","job":"oo_push","log":"hello #1","time":"..."}, ...]
-# -> [{"level":"info","job":"oo_push","log":"hello #3","time":"..."}]
+# -> [{"level":"info","job":"oo_push","log":"hello #1","time":"2026-11-17T10:50:04+08:00"}, ...]
+# -> [{"level":"info","job":"oo_push","log":"hello #3","time":"2026-11-17T10:50:04+08:00"}]
 ```
 
 stdin（管道）：
