@@ -257,6 +257,13 @@ typedef struct {
 	const char      *content;
 	size_t           content_len;
 	const mre_extra *extra;
+	/*
+	 * Request process pid for $context['pid']; 0 means "use this
+	 * process's getpid()".  The async path captures it in the request
+	 * process BEFORE fork(): the grandchild's getpid() is its own pid,
+	 * while every log line of the request carries the request's pid.
+	 */
+	zend_long        pid;
 	/* async only (NULL / ignored on the synchronous path) */
 	const char      *line;      /* rendered line, no trailing newline */
 	size_t           line_len;

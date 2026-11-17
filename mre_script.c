@@ -504,8 +504,11 @@ void mre_script_context_build(zval *ctx, const mre_script_ctxinfo *ci)
 	add_assoc_zval_ex(ctx, "method", sizeof("method") - 1, &tmp);
 
 	/* request identity - the same tag every log line of this request
-	 * carries (pid alone cannot identify a request under fpm) */
-	add_assoc_long_ex(ctx, "pid", sizeof("pid") - 1, (zend_long)getpid());
+	 * carries (pid alone cannot identify a request under fpm).  The async
+	 * path hands over the pid captured before fork(); calling getpid()
+	 * here in the grandchild would report the grandchild's pid instead. */
+	add_assoc_long_ex(ctx, "pid", sizeof("pid") - 1,
+		ci->pid > 0 ? ci->pid : (zend_long)getpid());
 	add_assoc_string_ex(ctx, "request_id", sizeof("request_id") - 1,
 		mre_request_id_get());
 
@@ -729,6 +732,8 @@ zend_bool mre_script_route(const char *type, const char *dir,
 	ci.content = content;
 	ci.content_len = content_len;
 	ci.extra = extra;
+	/* synchronous path: 0 = $context['pid'] is this process's getpid() */
+	ci.pid = 0;
 	/* synchronous path: no line/format keys in $context (contract kept) */
 	ci.line = NULL;
 	ci.line_len = 0;

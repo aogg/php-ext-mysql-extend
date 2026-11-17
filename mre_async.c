@@ -25,8 +25,9 @@
   |     (it would steal proc_open()/exec() children): the parent reaps   |
   |     only the pids it recorded, with WNOHANG, while handling later    |
   |     records;                                                         |
-  |   - a failed script execution in the grandchild prints one throttled |
-  |     stderr line instead of writing the main log;                     |
+  |   - a failed script execution in the grandchild prints one stderr    |
+  |     line per worker per 60 s window (atomic O_EXCL marker claim)     |
+  |     instead of writing the main log;                                 |
   |   - every Zend allocation the script makes dies with _exit() - the  |
   |     child never returns into the request that forked it;             |
   |   - a bailout raised by the script (exit()/fatal) is caught by the   |
@@ -178,8 +179,18 @@ static void mre_async_track_child(pid_t pid)
  * The grandchild must not write the main log (the line would carry the
  * child's pid and could recurse into the log script), so a failed script
  * execution goes to stderr - fpm puts it into its error log.  One marker
- * file per worker caps that at one line per 60 s:
- *   /tmp/.mre-async-warn-<worker pid>
+ * file per worker and per time bucket caps that at one line per 60 s:
+ *   /tmp/.mre-async-warn-<worker pid>-<bucket>
+ *   bucket = (long)(time(NULL) / MRE_ASYNC_WARN_INTERVAL)
+ *
+ * The claim is the creation itself: open(O_CREAT | O_EXCL) succeeds for
+ * exactly one grandchild per worker and window.  The old code probed
+ * stat()/mtime, printed, then refreshed the mtime - three non-atomic steps
+ * that let two same-instant failures both pass the probe and print twice.
+ *
+ * Growth is bounded: a marker is created only on failure - at most one
+ * empty file per worker per 60 s - and the system's /tmp cleanup removes
+ * them; nothing is written into the file.
  *
  * The pid is the WORKER pid captured before fork(): in the grandchild
  * getppid() is the already-exiting first-layer child (or 1), never the
@@ -190,21 +201,30 @@ static void mre_async_track_child(pid_t pid)
 static void mre_async_report_failure(pid_t worker_pid, const char *path,
                                      const char *summary)
 {
-	char marker[64];
+	char marker[96];
 	char buf[MRE_PATH_MAX + 256];
-	struct stat st;
 	time_t now;
 	size_t len;
-	int n, fd;
+	int n, fd = -1;
 
-	snprintf(marker, sizeof(marker), "/tmp/.mre-async-warn-%ld",
-		(long)worker_pid);
-
+	/*
+	 * Atomic claim: only the winner of O_EXCL prints.  EEXIST means
+	 * another grandchild of this worker already reported inside the
+	 * current window, so stay silent.  Any other open() failure (read-only
+	 * /tmp, no inodes, ...) must not silence the report - fall through and
+	 * print anyway ("rather over-report than go silent"), no retry.
+	 */
 	now = time(NULL);
-	if (stat(marker, &st) == 0 && now != (time_t)-1
-			&& now - st.st_mtime <= MRE_ASYNC_WARN_INTERVAL) {
-		return; /* this worker already reported a failure recently */
+	if (now != (time_t)-1) {
+		snprintf(marker, sizeof(marker),
+			"/tmp/.mre-async-warn-%ld-%ld",
+			(long)worker_pid, (long)(now / MRE_ASYNC_WARN_INTERVAL));
+		fd = open(marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd < 0 && errno == EEXIST) {
+			return; /* this window was already reported: one line */
+		}
 	}
+	/* now == (time_t)-1: no clock to bucket by, always report */
 
 	n = snprintf(buf, sizeof(buf),
 		"[mre] async log_script '%s' failed (%s); record dropped\n",
@@ -216,16 +236,8 @@ static void mre_async_report_failure(pid_t worker_pid, const char *path,
 		(void)write(STDERR_FILENO, buf, len);
 	}
 
-	/* create/refresh the marker: write() updates mtime, so the next
-	 * failure within the window above is suppressed */
-	fd = open(marker, O_WRONLY | O_CREAT, 0600);
 	if (fd >= 0) {
-		n = snprintf(buf, sizeof(buf), "%ld\n", (long)now);
-		if (n > 0) {
-			len = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
-			(void)write(fd, buf, len);
-		}
-		close(fd);
+		close(fd); /* empty marker file: existence == "reported" */
 	}
 }
 
@@ -305,8 +317,15 @@ void mre_async_write(const char *type, const char *dir,
 	 */
 	mre_async_reap_children();
 
-	/* the marker file for throttled failure reports is per worker */
+	/*
+	 * Capture the request process pid once, BEFORE fork(): the grandchild
+	 * cannot recover it (getpid() is the grandchild, getppid() is the
+	 * already-exiting first-layer child).  One value serves both the
+	 * per-worker failure throttle marker and $context['pid'], which must
+	 * match the pid inside the rendered log line.
+	 */
 	worker_pid = getpid();
+	ci.pid = (zend_long)worker_pid;
 
 	pid = fork();
 	if (pid > 0) {
