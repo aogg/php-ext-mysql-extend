@@ -9,7 +9,21 @@
   | - on open failure: degrade to stderr and warn once                   |
   |                                                                      |
   | This file must not allocate Zend memory: it can be invoked from the  |
-  | mysqlnd / streams hooks at any stage (even during shutdown).         |
+  | mysqlnd / streams hooks at any stage (even during shutdown), and     |
+  | from the fork()ed async grandchild.  Everything here is stack memory  |
+  | plus memcpy() of the fixed request-context snapshot kept in MRE_G by  |
+  | mre_reqctx.c.                                                        |
+  |                                                                      |
+  | Request context (since 0.2.0): every line also carries the fields    |
+  | the OpenObserve push record has - http_host / http_path /            |
+  | http_scheme / http_ip / headers (JSON only; text lines get the four  |
+  | http_* keys and skip headers).  Values are empty-skipped and the     |
+  | fields never appear for CLI requests.                                |
+  |                                                                      |
+  | Truncation rule: a line that does not fit into MRE_LOG_LINE_MAX is   |
+  | re-rendered compact but *complete* (valid JSON, closed object,       |
+  | "truncated":true) - a half-written string would poison every         |
+  | consumer of the log file.                                            |
   +----------------------------------------------------------------------+
 */
 
@@ -46,6 +60,35 @@ static void mre_lbuf_appendf(char *buf, size_t cap, size_t *len, const char *fmt
 	} else {
 		*len += written;
 	}
+}
+
+/*
+ * Atomic append: nothing is written unless the whole formatted text fits.
+ * Returns 1 on success, 0 when it does not fit (buffer left untouched).
+ * The structural JSON pieces use this - a value that does not fit must be
+ * skipped entirely instead of being half-written, otherwise the line stops
+ * being valid JSON.
+ */
+static zend_bool mre_lbuf_putf(char *buf, size_t cap, size_t *len,
+                               const char *fmt, ...)
+{
+	va_list ap;
+	int need;
+
+	if (buf == NULL || cap == 0 || *len >= cap) {
+		return (zend_bool)0;
+	}
+	va_start(ap, fmt);
+	need = vsnprintf(NULL, 0, fmt, ap);
+	va_end(ap);
+	if (need < 0 || (size_t)need + *len + 1 > cap) {
+		return (zend_bool)0;
+	}
+	va_start(ap, fmt);
+	(void)vsnprintf(buf + *len, cap - *len, fmt, ap);
+	va_end(ap);
+	*len += (size_t)need;
+	return (zend_bool)1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -386,6 +429,173 @@ static void mre_log_extra_text(char *buf, size_t cap, size_t *len, const mre_ext
 }
 
 /* ------------------------------------------------------------------ */
+/* request context (snapshot in MRE_G, taken by mre_reqctx.c)           */
+/* ------------------------------------------------------------------ */
+/*
+ * Field set / semantics are those of the OpenObserve push record
+ * (scripts/mre_oo_log_script.php -> mre_oo_record()): every value is only
+ * emitted when non-empty, and nothing at all is emitted for CLI requests.
+ * Values in the snapshot are already JSON-escaped; this code only copies
+ * bytes, never allocates.
+ */
+
+/* bytes the JSON context block needs (upper bound, used for reservation) */
+static size_t mre_ctx_json_need(void)
+{
+	size_t need = 0;
+
+	if (!MRE_G(reqctx_valid)) {
+		return 0;
+	}
+	if (MRE_G(reqctx_has_host)) {
+		need += strlen(MRE_G(reqctx_host)) + sizeof(",\"http_host\":\"\"");
+	}
+	if (MRE_G(reqctx_has_path)) {
+		need += strlen(MRE_G(reqctx_path)) + sizeof(",\"http_path\":\"\"");
+	}
+	if (MRE_G(reqctx_has_scheme)) {
+		need += strlen(MRE_G(reqctx_scheme)) + sizeof(",\"http_scheme\":\"\"");
+	}
+	if (MRE_G(reqctx_has_ip)) {
+		need += strlen(MRE_G(reqctx_ip)) + sizeof(",\"http_ip\":\"\"");
+	}
+	if (MRE_G(reqctx_has_headers)) {
+		need += strlen(MRE_G(reqctx_headers)) + sizeof(",\"headers\":{}");
+		if (MRE_G(reqctx_headers_truncated)) {
+			need += sizeof(",\"truncated\":true");
+		}
+	}
+	return need + 8; /* separators/rounding slack */
+}
+
+/* append the context block; 0 = some field did not fit (nothing partial) */
+static zend_bool mre_ctx_json_append(char *buf, size_t cap, size_t *len)
+{
+	if (!MRE_G(reqctx_valid)) {
+		return (zend_bool)1;
+	}
+	if (MRE_G(reqctx_has_host)
+			&& !mre_lbuf_putf(buf, cap, len, ",\"http_host\":\"%s\"",
+				MRE_G(reqctx_host))) {
+		return (zend_bool)0;
+	}
+	if (MRE_G(reqctx_has_path)
+			&& !mre_lbuf_putf(buf, cap, len, ",\"http_path\":\"%s\"",
+				MRE_G(reqctx_path))) {
+		return (zend_bool)0;
+	}
+	if (MRE_G(reqctx_has_scheme)
+			&& !mre_lbuf_putf(buf, cap, len, ",\"http_scheme\":\"%s\"",
+				MRE_G(reqctx_scheme))) {
+		return (zend_bool)0;
+	}
+	if (MRE_G(reqctx_has_ip)
+			&& !mre_lbuf_putf(buf, cap, len, ",\"http_ip\":\"%s\"",
+				MRE_G(reqctx_ip))) {
+		return (zend_bool)0;
+	}
+	if (MRE_G(reqctx_has_headers)) {
+		zend_bool ok = MRE_G(reqctx_headers_truncated)
+			? mre_lbuf_putf(buf, cap, len,
+				",\"headers\":{%s,\"truncated\":true}",
+				MRE_G(reqctx_headers))
+			: mre_lbuf_putf(buf, cap, len, ",\"headers\":{%s}",
+				MRE_G(reqctx_headers));
+		if (!ok) {
+			return (zend_bool)0;
+		}
+	}
+	return (zend_bool)1;
+}
+
+/* text format tail: http_* only; headers are deliberately not expanded */
+static void mre_ctx_text_append(char *buf, size_t cap, size_t *len)
+{
+	if (!MRE_G(reqctx_valid)) {
+		return;
+	}
+	if (MRE_G(reqctx_has_host)) {
+		mre_lbuf_appendf(buf, cap, len, " http_host=\"%s\"", MRE_G(reqctx_host));
+	}
+	if (MRE_G(reqctx_has_path)) {
+		mre_lbuf_appendf(buf, cap, len, " http_path=\"%s\"", MRE_G(reqctx_path));
+	}
+	if (MRE_G(reqctx_has_scheme)) {
+		mre_lbuf_appendf(buf, cap, len, " http_scheme=\"%s\"", MRE_G(reqctx_scheme));
+	}
+	if (MRE_G(reqctx_has_ip)) {
+		mre_lbuf_appendf(buf, cap, len, " http_ip=\"%s\"", MRE_G(reqctx_ip));
+	}
+}
+
+/*
+ * Truncation-safe JSON fallback.
+ *
+ * The regular assembly above truncates like a bounded buffer does: some
+ * append stops mid-string.  That is fine for text, not for JSON - a single
+ * half-written record makes any line-oriented consumer fail.  When the
+ * regular path reports truncation (or the context block did not fit, which
+ * must not silently disappear) the line is rendered again as a compact,
+ * guaranteed complete object:
+ *
+ *   {"time":...,"pid":...,"request_id":...,"type":...,"dir":...,
+ *    "content":"<as much as fits>","extra":null, <request context>,
+ *    "truncated":true}
+ *
+ * Log volume wins over detail on such a pathological record (it is over
+ * MRE_LOG_LINE_MAX = 16 KiB), and the request context is kept because it is
+ * what makes the truncated row still attributable.
+ */
+static size_t mre_log_format_json_truncated(char *buf, size_t cap,
+                                            const char *tsbuf,
+                                            const char *type_esc,
+                                            const char *dir_esc,
+                                            const char *content,
+                                            size_t content_len)
+{
+	size_t len = 0, room, need;
+	static const char minimal[] = "{\"truncated\":true}";
+
+	if (!mre_lbuf_putf(buf, cap, &len,
+			"{\"time\":\"%s\",\"pid\":%d,\"request_id\":\"%s\","
+			"\"type\":\"%s\",\"dir\":\"%s\",\"content\":\"",
+			tsbuf, (int)getpid(), mre_request_id_get(), type_esc, dir_esc)) {
+		if (sizeof(minimal) <= cap) {
+			memcpy(buf, minimal, sizeof(minimal)); /* incl. NUL */
+			return sizeof(minimal) - 1;
+		}
+		buf[0] = '\0';
+		return 0;
+	}
+
+	/* reserve the tail: closing quote, extra, context block, truncated flag */
+	need = mre_ctx_json_need() + sizeof("\",\"extra\":null,\"truncated\":true}");
+	if (cap <= len + need) {
+		room = 0;
+	} else {
+		room = cap - len - need;
+	}
+	len += mre_json_escape(content, content_len, buf + len, room);
+	buf[len++] = '"';
+	buf[len] = '\0';
+
+	(void)mre_lbuf_putf(buf, cap, &len, ",\"extra\":null");
+	(void)mre_ctx_json_append(buf, cap, &len);
+	if (!mre_lbuf_putf(buf, cap, &len, ",\"truncated\":true}")) {
+		/* cannot happen with the reservation above (kept as a hard guarantee:
+		 * never emit a half-written object) */
+		if (sizeof(minimal) <= cap) {
+			memcpy(buf, minimal, sizeof(minimal));
+			return sizeof(minimal) - 1;
+		}
+		buf[0] = '\0';
+		return 0;
+	}
+	buf[len] = '\0';
+	return len;
+}
+
+/* ------------------------------------------------------------------ */
 /* public API                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -427,8 +637,13 @@ size_t mre_log_format_line(char *buf, size_t cap,
 			extra->time_start, strlen(extra->time_start));
 	}
 
+	/* refresh the fixed request-context snapshot (read-only, allocation-free;
+	 * it re-reads $_SERVER per record on purpose, see mre_reqctx.c) */
+	mre_reqctx_ensure();
+
 	if (MRE_G(cfg).json_format) {
 		char typebuf[16], dirbuf[16];
+		zend_bool ctx_ok;
 
 		mre_json_escape(type, type ? strlen(type) : 0, typebuf, sizeof(typebuf));
 		mre_json_escape(dir, dir ? strlen(dir) : 0, dirbuf, sizeof(dirbuf));
@@ -440,7 +655,14 @@ size_t mre_log_format_line(char *buf, size_t cap,
 			tsbuf, (int)getpid(), mre_request_id_get(), typebuf, dirbuf, esc);
 		mre_lbuf_appendf(buf, cap, &len, ",");
 		mre_log_extra_json(buf, cap, &len, extra, esc);
+		/* request context goes after "extra", before the closing brace:
+		 * the existing field order never changes */
+		ctx_ok = mre_ctx_json_append(buf, cap, &len);
 		mre_lbuf_appendf(buf, cap, &len, "}");
+		if (!ctx_ok || len >= cap - 1) {
+			len = mre_log_format_json_truncated(buf, cap, tsbuf,
+				typebuf, dirbuf, content, content_len);
+		}
 	} else {
 		mre_json_escape(content, content_len, esc, sizeof(esc));
 		mre_lbuf_appendf(buf, cap, &len,
@@ -448,6 +670,7 @@ size_t mre_log_format_line(char *buf, size_t cap,
 			tsbuf, (int)getpid(), mre_request_id_get(),
 			type ? type : "", dir ? dir : "", esc);
 		mre_log_extra_text(buf, cap, &len, extra);
+		mre_ctx_text_append(buf, cap, &len);
 	}
 
 	if (len >= cap) {

@@ -120,6 +120,11 @@ PHP_RINIT_FUNCTION(mre)
 	/* env > ini every request (env may change between fpm requests) */
 	mre_config_refresh();
 
+	/* request context snapshot rendered into every log line; on an HTTP
+	 * request this also materializes $_SERVER (RINIT may allocate, the log
+	 * path may not) */
+	mre_reqctx_rinit();
+
 	/* load / reload yaml rules when the file changed */
 	mre_yaml_config_ensure();
 

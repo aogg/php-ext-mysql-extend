@@ -110,7 +110,7 @@ yaml 规则 / `mre.log_file`。
 | `pass` | `MRE_OO_PASS` | 无（空） | HTTP Basic 密码；为空 = 不推送（`no_pass`）；任何输出/debug 都不回显 |
 | `timeout` | `MRE_OO_TIMEOUT` | `5` | 单次请求总超时（秒，1~30，默认 5），同时作为 connect timeout 的上限 |
 | `insecure` | `MRE_OO_INSECURE` | `1` | `1` = 跳过 TLS 证书校验（等价 `curl -k`：`CURLOPT_SSL_VERIFYPEER=false` + `VERIFYHOST=0`；stream 分支对应 `verify_peer/verify_peer_name=false`）；`0` = 正常校验 |
-| `batch` | `MRE_OO_BATCH` | `1` | `1` = 请求内累积、shutdown 时合并发送；`0` = 每条记录即时单条 POST |
+| `batch` | `MRE_OO_BATCH` | `1` | `1` = 请求内累积、shutdown 时合并发送；`0` = 每条记录即时单条 POST。**异步模式（`$context['line']` 存在）下不生效，一律逐条即时发送**，见 §五 |
 | `debug` | `MRE_OO_DEBUG` | `0` | `1` = 把推送结果/跳过原因写进 `debug_file`（一行一个 JSON，**不含密码**） |
 | `debug_file` | 无 | `/tmp/mre-oo-push.log` | debug 输出文件；追加写 + `LOCK_EX` |
 | `max_buffer` | 无 | `1000` | 缓冲上限（1~100000）：达到即提前 flush，防止长时间请求内存膨胀 |
@@ -225,6 +225,19 @@ php -d xdebug.mode=off -l /opt/mre/scripts/mre_oo_log_script.php
 缓冲达到 `max_buffer`（默认 1000 条）时立即发送一次，避免单个长请求把记录全攒在内存里。
 **注意这是一次请求内的同步 curl**：最坏情况会阻塞当前请求 `timeout` 秒（默认 5 秒）。
 因此 `max_buffer` 不要设得太小（设成 1 等于退化成逐条同步发送）。
+
+### 异步模式（`mre.log_script_async`）：每条即时发送，`batch` 不生效
+
+扩展以 `mre.log_script_async` 运行时，本脚本跑在 fork 出来的**孙进程**里，而孙进程做完事
+只 `_exit(0)`：**不会执行 shutdown 回调**。因此：
+
+- 只要 `$context['line']` 存在（异步模式的标志），本脚本**跳过缓冲、逐条即时 POST**，
+  绝不 `register_shutdown_function()`；`batch=1` 在这里没有任何意义。
+- 否则 `batch=1`（默认）下记录只会进缓冲，然后随孙进程一起消失——这就是 0.1.x
+  异步 + oo 脚本「一条都发不出去」的原因（0.2.0 修复）。
+- 同步模式（`mre.log_script`）行为完全不变：`batch=1` 仍在本请求 shutdown 时合并发送。
+- 异步下每条记录一次 POST，`max_buffer` 也不再相关；本地日志照旧由 router 自写。
+  `$context['line']` 原样随推送记录带上（记录里同时有展开后的 `http_host` 等字段）。
 
 ### `batch=0`：每条即时单条发送
 

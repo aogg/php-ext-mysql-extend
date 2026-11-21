@@ -36,6 +36,7 @@ if test "$PHP_MRE" != "no"; then
      mre_config.c \
      mre_util.c \
      mre_log.c \
+     mre_reqctx.c \
      mre_yaml.c \
      mre_rules.c \
      mre_script.c \

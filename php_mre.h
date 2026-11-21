@@ -18,7 +18,7 @@
 /* ------------------------------------------------------------------ */
 /* Version                                                             */
 /* ------------------------------------------------------------------ */
-#define PHP_MRE_VERSION "0.1.0-a1"
+#define PHP_MRE_VERSION "0.2.0"
 
 /* ------------------------------------------------------------------ */
 /* Includes                                                            */
@@ -58,6 +58,20 @@
 #define MRE_SCRIPT_WARN_MAX 256   /* script failure summary buffer     */
 #define MRE_LOG_LINE_MAX    16384 /* one log line, stack allocated     */
 #define MRE_JSON_VAL_MAX    8192  /* escaped content cap inside a line */
+
+/* request context snapshot rendered into every log line (mre_reqctx.c):
+ * plain fixed buffers in the module globals, never Zend memory - the log
+ * line renderer must stay allocation-free (it also runs in fork()ed
+ * grandchildren).  Budgets are deliberately small: a header block larger
+ * than this is truncated (with "truncated":true) instead of bloating the
+ * line. */
+#define MRE_REQCTX_HOST_MAX        256
+#define MRE_REQCTX_PATH_MAX        512
+#define MRE_REQCTX_SCHEME_MAX      16
+#define MRE_REQCTX_IP_MAX          64
+#define MRE_REQCTX_HEADERS_MAX     2048
+#define MRE_REQCTX_HEADER_NAME_MAX 128 /* one escaped header name        */
+#define MRE_REQCTX_HEADER_VAL_MAX  512 /* one escaped header value       */
 #define MRE_EXTRA_KV_MAX    12    /* max extra key/value pairs         */
 #define MRE_EXTRA_VAL_MAX   560   /* max rendered value per extra item */
 
@@ -388,6 +402,32 @@ void mre_request_id_next(void);       /* RINIT: bump + re-render */
 const char *mre_request_id_get(void); /* current id, never NULL */
 
 /* ------------------------------------------------------------------ */
+/* Request context snapshot (mre_reqctx.c)                             */
+/* ------------------------------------------------------------------ */
+/*
+ * http_host / http_path / http_scheme / http_ip / headers on every log
+ * line, with exactly the semantics of the OpenObserve push record
+ * (scripts/mre_oo_log_script.php mre_oo_record()):
+ *   http_host   HTTP_HOST, empty -> SERVER_NAME (port preserved)
+ *   http_path   path part of REQUEST_URI (query/fragment dropped)
+ *   http_scheme HTTPS non-empty and not "off" -> https; else REQUEST_SCHEME
+ *               lowered; else http (only when the request looks like HTTP)
+ *   http_ip     REMOTE_ADDR
+ *   headers     HTTP_* -> lower, '_' -> '-'; plus CONTENT_TYPE/CONTENT_LENGTH
+ * Nothing is emitted for CLI / non-HTTP requests.
+ *
+ * mre_reqctx_rinit() resets the snapshot (and materializes $_SERVER on the
+ * first RINIT of an HTTP request: allocating Zend memory is allowed there,
+ * it is not allowed in mre_log.c).  mre_reqctx_ensure() re-reads it from
+ * $_SERVER with read-only hashtable lookups - no allocation at all, and
+ * re-scanned on every record (a hash-table identity check cannot detect an
+ * in-place $_SERVER edit reliably) - and is what the log line renderer
+ * calls.
+ */
+void mre_reqctx_rinit(void);   /* per request: reset + prime $_SERVER */
+void mre_reqctx_ensure(void);  /* refresh from $_SERVER (read-only)   */
+
+/* ------------------------------------------------------------------ */
 /* Module globals                                                      */
 /* ------------------------------------------------------------------ */
 ZEND_BEGIN_MODULE_GLOBALS(mre)
@@ -417,6 +457,21 @@ ZEND_BEGIN_MODULE_GLOBALS(mre)
 	zend_bool      script_warned;   /* one-time degradation warning      */
 	zend_bool      script_busy;     /* re-entrancy guard                 */
 	zend_bool      script_async_warned; /* one-time async-drop warning   */
+
+	/* request context snapshot (mre_reqctx.c): plain C buffers only, the
+	 * log line renderer memcpy()s them - never Zend memory */
+	zend_bool      reqctx_valid;    /* 1 = at least one http field captured */
+	zend_bool      reqctx_has_host;
+	char           reqctx_host[MRE_REQCTX_HOST_MAX];
+	zend_bool      reqctx_has_path;
+	char           reqctx_path[MRE_REQCTX_PATH_MAX];
+	zend_bool      reqctx_has_scheme;
+	char           reqctx_scheme[MRE_REQCTX_SCHEME_MAX];
+	zend_bool      reqctx_has_ip;
+	char           reqctx_ip[MRE_REQCTX_IP_MAX];
+	zend_bool      reqctx_has_headers;
+	zend_bool      reqctx_headers_truncated;
+	char           reqctx_headers[MRE_REQCTX_HEADERS_MAX]; /* escaped pairs */
 
 	/* global transaction (mre_gtx.c) */
 	int            gtx_epoch;       /* bumped per request                */

@@ -94,10 +94,16 @@ return call_user_func(function () use ($context) {
     //     }
     // }
 
-    /* ---- 3) 日志目录（脚本侧确保存在，扩展写日志另有 mkdir -p 兜底） ---- */
+    /* ---- 3) 日志目录（脚本侧确保存在，扩展写日志另有 mkdir -p 兜底） ----
+     * 并发孙进程可能同时创建同一目录：@mkdir 失败不代表目录不可用（EEXIST），
+     * 失败后重试一次，仍失败就交给下面的 fopen 重试兜底（不静默丢行）。 */
     $logDir = $root . '/runtime/mre-logs';
     if (!is_dir($logDir)) {
         @mkdir($logDir, 0755, true);
+        if (!is_dir($logDir)) {
+            usleep(10000);
+            @mkdir($logDir, 0755, true);
+        }
     }
 
     /* ---- 4) URL 路径 → 文件名 base ---- */
@@ -186,7 +192,22 @@ return call_user_func(function () use ($context) {
     $v = isset($context['line']) ? $context['line'] : null;
     $line = is_string($v) ? $v : null;
     if ($line !== null) {
-        $fp = @fopen($path, 'ab');
+        /* 首次创建目录时，另一个孙进程可能刚刚/正在创建同一目录，fopen 会瞬时
+         * 失败（ENOENT）。这里最多试两次：失败时补建目录并稍等再开一次，
+         * 两次都失败才放弃（不输出、不抛异常，绝不静默丢第一批行）。 */
+        $fp = false;
+        for ($try = 0; $try < 2; $try++) {
+            $fp = @fopen($path, 'ab');
+            if ($fp !== false) {
+                break;
+            }
+            if (!is_dir($logDir)) {
+                @mkdir($logDir, 0755, true);
+            }
+            if ($try === 0) {
+                usleep(20000);
+            }
+        }
         if ($fp !== false) {
             if (flock($fp, LOCK_EX)) {
                 fwrite($fp, $line . "\n");

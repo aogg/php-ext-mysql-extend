@@ -31,6 +31,11 @@
  *   扩展不再落盘、并 fork 子进程执行本脚本。被 include 的 mre_log_router.php 检测到
  *   $context['line'] 后会自行 flock+fwrite，本地日志行为不变；本文件的推送逻辑不变，
  *   只是现在跑在子进程里，不再占用业务请求时间（$context['line'] 原样随推送记录带上）。
+ *
+ *   重要：异步孙进程只 _exit(0)，**永远不会执行 shutdown 回调**。所以只要检测到
+ *   $context['line']（异步模式的标志），本文件就**即时单条发送**，绝不入缓冲、
+ *   绝不 register_shutdown_function —— 否则 batch=1（默认）下一条都发不出去。
+ *   `batch` 配置在异步模式下因此不生效；同步模式行为完全不变（batch=1 仍合并）。
  */
 
 /* ====================================================================
@@ -857,16 +862,20 @@ if (!function_exists('mre_oo_flush_at_shutdown')) {
 /**
  * 收一条记录：按配置决定进缓冲还是立即发送。
  *
+ * $immediate=true（异步孙进程，即 $context['line'] 存在时）：永远即时单条 POST。
+ *   孙进程只 _exit(0)，shutdown 回调不会执行，缓冲 = 静默丢记录，所以异步下
+ *   batch 配置不生效。
  * batch=1：首次入队时注册 shutdown flush（一个请求只注册一次）；
  *          缓冲达到 max_buffer 时提前同步 flush；
  * shutdown flush 之后到达的记录（如 gtx 收尾补的记录）走单条即时发送。
  * batch=0：每条即时单条 POST。
  *
- * @param array $record 待推送记录
+ * @param array $record    待推送记录
+ * @param bool  $immediate 异步孙进程：跳过缓冲直接发
  * @return void
  */
 if (!function_exists('mre_oo_enqueue')) {
-    function mre_oo_enqueue($record)
+    function mre_oo_enqueue($record, $immediate = false)
     {
         if (!is_array($record)) {
             return;
@@ -885,8 +894,9 @@ if (!function_exists('mre_oo_enqueue')) {
             return;
         }
 
-        if (empty($cfg['batch']) || !empty($state['flushed'])) {
-            // 单条即时发送：batch=0，或 shutdown flush 已跑过（late record）
+        if ($immediate || empty($cfg['batch']) || !empty($state['flushed'])) {
+            // 单条即时发送：异步孙进程（$immediate）、batch=0，或 shutdown
+            // flush 已跑过（late record）。异步孙进程只会 _exit(0)，绝不能入缓冲。
             mre_oo_push(array($record));
             return;
         }
@@ -939,7 +949,10 @@ return call_user_func(function () use ($context) {
     try {
         $cfg = mre_oo_config();
         if (!empty($cfg['enable'])) {
-            mre_oo_enqueue(mre_oo_record($current, $path));
+            /* 异步标志：扩展在异步模式下给 $context 追加 line（已渲染整行）。
+             * 异步孙进程只 _exit(0)、不跑 shutdown，所以必须即时发送。 */
+            $immediate = isset($current['line']) && is_string($current['line']);
+            mre_oo_enqueue(mre_oo_record($current, $path), $immediate);
         }
     } catch (\Throwable $e) {
         mre_oo_debug('push_failed', array('error' => $e->getMessage()));

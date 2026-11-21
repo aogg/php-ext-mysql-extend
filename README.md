@@ -5,6 +5,7 @@
 - **MySQL 流量**：通过 mysqlnd 扩展点拦截，覆盖 **mysqli、PDO_MYSQL**（两者底层都走 mysqlnd）以及一切基于 mysqlnd 的连接类；记录 SQL 文本、执行起止时间与耗时（`extra.time_end`/`extra.cost_ms`）、影响行数/返回行数、错误码/错误信息，返回行内容可按条数采样（默认 1 行）。
 - **Redis 流量**：通过 PHP streams 传输层嗅探 RESP 协议，覆盖 **phpredis（Redis/RedisCluster 扩展类）与 Predis（用户态类）**——两者建连最终都走 PHP streams，记录发送的命令与返回的响应。
 - 日志一行一条，默认 JSON lines，`flock` 保证多进程（fpm）并发安全；支持写入文件、`stdout`、`stderr` 以及 **`/proc/1/fd/1`（docker 容器内输出到 pid1 stdout）**。
+- 每条行都带**请求上下文**（`http_host`/`http_path`/`http_scheme`/`http_ip`/`headers`，与推送记录同名同语义，CLI 下自动省略），见下文「请求上下文」。
 
 兼容 PHP **7.4 与 8.0 ~ 8.4**（源码内用 `PHP_VERSION_ID` 宏分支处理 API 差异），无任何外部库依赖（YAML 为内置精简解析器，不链接 libyaml）。
 
@@ -144,6 +145,38 @@ fpm 下同一个 worker 进程（同一个 `pid`）会**串行处理多个请求
 - 同一请求的所有日志行 `request_id` 相同，不同请求不同——json 与 text 两种格式都带该字段，`pid` 字段保持不变。
 - 该标识同时注入脚本回调的 `$context['request_id']`（见下文），路由脚本可用它把"自己写的辅助日志"与扩展日志对齐。
 
+### 请求上下文（http_host / http_path / http_scheme / http_ip / headers）
+
+0.2.0 起，每条行的对象在 `extra` **之后**追加请求上下文字段（顺序固定，已有字段顺序不变），字段名与语义与 OpenObserve 推送记录（`scripts/mre_oo_log_script.php` → `mre_oo_record()`）完全一致：
+
+| 字段 | 来源与规则 |
+|---|---|
+| `http_host` | `$_SERVER['HTTP_HOST']`（**保留端口**），为空回退 `SERVER_NAME`；trim 后仍为空则省略 |
+| `http_path` | `$_SERVER['REQUEST_URI']` 的 path 部分（去掉 `?`/`#` 之后；绝对形式 `scheme://host/path` 只取 path）；为空则省略 |
+| `http_scheme` | `HTTPS` 非空且不是 `off`（大小写不敏感）→ `https`；否则 `REQUEST_SCHEME`（小写）；否则 `http`。只在能判定是 HTTP 请求（有 host 或 uri）时出现 |
+| `http_ip` | `$_SERVER['REMOTE_ADDR']`（直连地址，不猜 `X-Forwarded-For`） |
+| `headers` | 全部请求头的对象：`HTTP_*` 取后缀、转小写、`_`→`-`，外加 `CONTENT_TYPE`/`CONTENT_LENGTH`；规则与脚本回调 `$context['headers']` **完全同源**（CLI 下没有该对象） |
+
+规则：
+
+- **只出现非空值**；CLI / 非 HTTP 请求下这些字段全部不出现（行结构与 0.1.x 相同）。
+- `headers` 对象总预算 2048 字节、单个头值 ≤ 512 字节（超出截断）；超出预算时停止追加，并在对象内标记 `"truncated":true`，**不会产生非法 JSON**。
+- 整行仍受 16384 字节上限保护；真的超长时改为渲染一条**合法 JSON** 的紧凑行（`content` 尽量保留、`extra:null`、请求上下文保留、结尾 `"truncated":true`），不再输出半截字符串。
+- **text 格式**：在行尾追加 ` http_host="..." http_path="..." http_scheme="..." http_ip="..."`（值按 JSON 规则转义并加引号）；`headers` 在 text 下**不展开**（要用 headers 请用 `mre.log_format=json`）。
+- 实现上不分配 Zend 内存：`mre_reqctx.c` 在 RINIT 把 `$_SERVER` 相关内容拷进固定栈外缓冲（`MRE_G`），行渲染只做 memcpy（见 `docs/设计.md` §5、§9.3）。
+
+JSON 示例（一条 mysql req 行，字段追加在 `extra` 之后）：
+
+```json
+{"time":"2026-11-21T10:02:22+08:00","pid":62030,"request_id":"62030-1","type":"mysql","dir":"req","content":"SELECT 1","extra":{"cmd":"query","host":"127.0.0.1","port":3306,"time_end":"2026-11-21T10:02:22+08:00","cost_ms":0.412},"http_host":"api.example.com:8080","http_path":"/api/user/list","http_scheme":"https","http_ip":"203.0.113.9","headers":{"host":"api.example.com:8080","user-agent":"curl/8.4.0","x-foo-bar":"baz","content-type":"application/json"}}
+```
+
+text 示例：
+
+```
+2026-11-21T10:02:22+08:00 pid=62030 request_id=62030-1 type=mysql dir=req content="SELECT 1" cmd=query host=127.0.0.1 port=3306 time_end=2026-11-21T10:02:22+08:00 cost_ms=0.412 http_host="api.example.com:8080" http_path="/api/user/list" http_scheme="https" http_ip="203.0.113.9"
+```
+
 截断策略：SQL ≤ 4096 字节；绑定参数单个值 ≤ 256 字节（超出尾部加 `…(N)`，N 为原始字节数）、最多记 32 个（超出置 `prepared.truncated=true`，params 片段整体 ≤ 2048 字节同样触发）；blob 参数记 `0x` + 前 32 字节 hex + `…(N bytes)`；redis 命令 ≤ 2048 字节（单参数 ≤ 256）；redis 响应摘要 ≤ 512 字节；采样行 ≤ 512 字节（16 列、单列 ≤ 64）。超限置 `extra.truncated=true`（redis/采样行）或 `prepared.truncated=true`（绑定参数）。
 
 ## 日志路由（阶段B）
@@ -224,6 +257,8 @@ return null;                              // null/空/非字符串 -> 降级到 
 - **日志目录要放本地文件系统**：异步是多子进程并发追加同一文件。实测（Docker Desktop for Windows）日志写到宿主 Windows 盘共享（容器 `/app/origin`，9p/drvfs）时 10 轮有 7 轮丢 0~4 行，写到容器 overlay（`/tmp`）则 10 轮 50/50 零丢失；扩展侧计数始终 50/50，丢在文件系统层 append。请写真实 Linux 盘 / 容器 overlay / 非网络共享卷，不要直接写 Docker Desktop 的 Windows 盘共享目录。详见 [docs/异步脚本.md](docs/异步脚本.md) §8。
 - **故障降级**：fork 失败或 ZTS 构建下**丢弃该条记录**并每进程告警一次，绝不回落同步、绝不阻塞请求；子进程内脚本 `stat` 失败/异常则静默结束该子进程（脚本自己的错误请写自己的错误日志）。
 - 仓库自带的 `scripts/mre_log_router.php`（以及 include 它的 `mre_oo_log_script.php`）**已内置自写模式**：检测到 `$context['line']` 就自行追加落盘，脚本文件不用改。迁移只需把 ini 里的 `mre.log_script` 换成 `mre.log_script_async`（路径不变），详见 [docs/异步脚本.md](docs/异步脚本.md)。
+- **推送脚本在异步下必须即时发送**：孙进程只 `_exit(0)`，`register_shutdown_function()` 注册的回调**永远不会执行**。所以带推送的脚本（如 `mre_oo_log_script.php`）检测到 `$context['line']` 时必须跳过缓冲、每条即时 POST——`batch` 配置在异步模式下不生效（同步模式仍按 `batch` 合并）。仓库脚本已内置该分支，见 [docs/mre_oo_log_script.md](docs/mre_oo_log_script.md) §5。
+- **行里的请求上下文照旧**：`line` 就是同步模式会写的同一份字节，`http_host`/`http_path`/`http_scheme`/`http_ip`/`headers` 一并带出（RINIT 已抓取快照，不依赖业务代码是否碰过 `$_SERVER`）。
 
 ```ini
 ; 同步配置
