@@ -1,7 +1,17 @@
 name: build
 
+# Trigger scope:
+#   - push to main          -> 12 builds (Actions Artifacts) + `latest` job
+#   - push of a v* tag      -> 12 builds (Actions Artifacts) + version `release` job
+#   - pull_request          -> 12 builds only
+#   - workflow_dispatch     -> 12 builds only
+# The `latest` tag this workflow itself pushes does NOT match `v*` and is not a
+# branch push, so it does not start another build/release cycle. (Tag pushes
+# made with the workflow's GITHUB_TOKEN never trigger workflows anyway.)
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -82,7 +92,7 @@ jobs:
           file "$out/$base.so"
 
       # Every build job produces a file literally called BUILD-INFO, and the
-      # release job merges all artifacts into one directory (merge-multiple),
+      # publish jobs merge all artifacts into one directory (merge-multiple),
       # where those copies would overwrite each other. Rename it to a
       # matrix-unique name after the verification above; the .tar.gz keeps
       # BUILD-INFO under its original name, so build-mre.sh stays untouched.
@@ -107,21 +117,30 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Release publishing — tag pushes only (v0.2.0 style). Branch pushes, PRs and
-  # manual dispatches stop at the Actions Artifacts above. `needs: build` means
-  # one failing build keeps this job from running at all.
+  # Rolling "latest" publishing — every push to main.
+  #
+  # After all 12 builds succeed (`needs: build`; one failure keeps this job from
+  # running), this job moves the permanent `latest` tag to the pushed commit and
+  # replaces the assets of the `latest` GitHub Release with the fresh 12 packages.
+  # Version releases stay opt-in: push a v* tag to freeze a version.
   # ---------------------------------------------------------------------------
-  release:
-    name: publish release ${{ github.ref_name }}
+  latest:
+    name: publish latest (rolling)
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write   # create/update the GitHub Release and upload assets
+      contents: write   # force-move the latest tag + create/update the Release
       actions: read     # read the artifacts produced by this same run
 
     steps:
+      # Needed both for the repository-local verify script and for `git push`
+      # of the force-moved tag (checkout persists the job token credentials).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Download every build artifact into one directory
         uses: actions/download-artifact@v4
         with:
@@ -130,45 +149,102 @@ jobs:
           merge-multiple: true
 
       - name: Merge checksums and verify all 12 packages
+        run: sh .github/scripts/verify-release-assets.sh release
+
+      # The tag is moved only after the assets passed verification, so a broken
+      # build can never re-point `latest` at unusable artifacts. `contents:
+      # write` above authorises the push; no PAT is involved.
+      - name: Force-move the latest tag to the built commit
         run: |
           set -eu
-          cd release
-          echo "--- downloaded files ---"
-          ls -l
+          git tag -f latest "$GITHUB_SHA"
+          git push --force origin refs/tags/latest
 
-          # One SHA256SUMS for the whole release. Each build wrote its own
-          # single-entry .so.sha256 with a plain basename, so `-c` resolves
-          # from this directory.
-          cat ./*.so.sha256 > SHA256SUMS
+      - name: Create or update the latest GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: mre latest
+          body: |
+            mre（mysql-redis-extend）PHP 扩展的**滚动最新**预编译产物。
 
-          # 6 PHP series x 2 libc = 12 jobs. needs: build already guarantees
-          # none of them failed; these counts additionally guarantee none
-          # silently produced fewer files. Keep in sync with the matrix.
-          test "$(wc -l < SHA256SUMS)" -eq 12
-          test "$(ls -1 ./*.so | wc -l)" -eq 12
-          test "$(ls -1 ./*.tar.gz | wc -l)" -eq 12
-          test "$(ls -1 ./BUILD-INFO-*.txt | wc -l)" -eq 12
+            本 Release 由 CI 永久维护：每次向 `main` 推送、12 个构建 job 全部成功后，
+            自动把 `latest` 标签移动到该提交，并整体替换本 Release 的 49 个资产。
+            不需要每次打不同的版本标签；想冻结某一版时再推 `v*` 标签发版本 Release。
 
-          # Cross-check every BUILD-INFO against its own file name and module,
-          # so a merge mix-up or a mislabelled package cannot reach the release.
-          for f in ./BUILD-INFO-*.txt; do
-            php=$(awk -F= '/^php_series=/{print $2; exit}' "$f")
-            libc=$(awk -F= '/^libc=/{print $2; exit}' "$f")
-            art=$(awk -F= '/^artifact=/{print $2; exit}' "$f")
-            if [ "$f" != "./BUILD-INFO-${php}-${libc}.txt" ]; then
-              echo "BUILD-INFO name/content mismatch: $f (php_series=$php libc=$libc)" >&2
-              exit 1
-            fi
-            if [ ! -f "./$art.so" ]; then
-              echo "module missing for artifact=$art (declared by $f)" >&2
-              exit 1
-            fi
-          done
+            - commit：${{ github.sha }}
+            - 构建运行：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - 触发：`${{ github.ref }}`（${{ github.event_name }}）
 
-          echo "--- SHA256SUMS ---"
-          cat SHA256SUMS
-          echo "--- sha256sum -c SHA256SUMS ---"
-          sha256sum -c SHA256SUMS
+            ## 选择哪个包
+
+            - **Alpine / musl 环境**：`mre-<php>-musl-x86_64-nts.so`（或同名 `.tar.gz`）
+            - **Debian / Ubuntu / glibc 环境**：`mre-<php>-glibc-x86_64-nts.so`（或同名 `.tar.gz`）
+            - `<php>` 必须与本机 PHP **主次版本完全一致**（Zend API 不同，`.so` 不能跨版本混用）
+            - 每个环境具体的 glibc/musl 版本、PHP API 号、编译器与 git sha，
+              见对应的 `BUILD-INFO-<php>-<libc>.txt`
+
+            ## 校验
+
+            ```bash
+            sha256sum -c SHA256SUMS                          # 全量 12 份
+            sha256sum -c mre-8.3-musl-x86_64-nts.so.sha256   # 单个
+            ```
+
+            ## 安装
+
+            ```ini
+            ; php.ini —— mysqlnd 为独立 .so 的发行版必须先加载它
+            extension=mysqlnd.so
+            extension=mre.so
+            ```
+
+            ```bash
+            php -m | grep mre
+            php -i | grep -A 14 '^mre$'
+            ```
+
+            `.tar.gz` 内含 `.so`、`.so.sha256` 与 `BUILD-INFO`（保持原文件名，随包追溯构建环境）。
+          files: |
+            release/*.so
+            release/*.so.sha256
+            release/*.tar.gz
+            release/BUILD-INFO-*.txt
+            release/SHA256SUMS
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          make_latest: true
+
+  # ---------------------------------------------------------------------------
+  # Version releases — v* tag pushes only (v0.2.0 style). Kept fully independent
+  # from the rolling `latest` job above: a v* tag publishes that tag, branch
+  # pushes never publish here. `needs: build` means one failing build keeps this
+  # job from running at all.
+  # ---------------------------------------------------------------------------
+  release:
+    name: publish release ${{ github.ref_name }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # create/update the GitHub Release and upload assets
+      actions: read     # read the artifacts produced by this same run
+
+    steps:
+      # The verify logic is shared with the `latest` job; checking out the built
+      # ref makes .github/scripts/verify-release-assets.sh available here.
+      - uses: actions/checkout@v4
+
+      - name: Download every build artifact into one directory
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mre-*
+          path: release
+          merge-multiple: true
+
+      - name: Merge checksums and verify all 12 packages
+        run: sh .github/scripts/verify-release-assets.sh release
 
       - name: Create or update the GitHub Release
         uses: softprops/action-gh-release@v2

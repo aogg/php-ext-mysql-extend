@@ -33,19 +33,37 @@ Actions Artifact 名为 `mre-<phpver>-<glibc|musl>-x86_64-nts`，内含 `mre-<..
 
 ### Actions Artifacts 与 GitHub Release 的区别
 
-- **普通 push / PR / 手动 `workflow_dispatch`**：12 个 build job 全部成功后**只上传 Actions Artifacts**，
+- **PR / 手动 `workflow_dispatch`**：12 个 build job 全部成功后**只上传 Actions Artifacts**，
   不发 Release（见 run 页面的 Artifacts 区）。
-- **推 tag（如 `v0.2.0`）**：除 Actions Artifacts 外，额外跑一个 `release` job，把 12 份产物合并发布到
-  GitHub Releases。`release` job 带 `needs: build`，**任何一个 build 失败它都不会执行**；
-  它还会先合并生成 `SHA256SUMS` 并 `sha256sum -c` 逐份校验，校验或数量（12 份）不符即失败、不发布。
+- **push 到 `main`**：除 Actions Artifacts 外，额外跑 `latest` job，自动更新滚动的
+  **`latest` Release**（见下节）。
+- **推 `v*` 标签（如 `v0.2.0`）**：除 Actions Artifacts 外，额外跑 `release` job，把 12 份产物合并
+  发布到该标签的**版本 Release**。
 
-发版操作：
+`latest` 与版本 `release` 两个发布 job 都带 `needs: build`，**任何一个 build 失败它们都不会执行**。
+两条路径共用 `.github/scripts/verify-release-assets.sh` 做发布前校验：合并生成 `SHA256SUMS`、
+`sha256sum -c` 逐份校验、确认 `.so`/`.tar.gz`/`BUILD-INFO-<php>-<libc>.txt` 各 12 份，
+并交叉核对每个 `BUILD-INFO` 与自身文件名、`artifact=`/`php_series=`/`libc=` 声明是否一致；
+校验或数量（12 份）不符即失败、不发布。
+
+### 永久 `latest`：不需要每次打标签
+
+- 每次向 `main` 推送、12 个构建全部成功后，`latest` job 会把**永久标签 `latest`** 强制移动到
+  该提交，并用最新 12 份产物**整体替换**同名 `latest` Release 的 49 个资产
+  （12 ×(`.so` + `.so.sha256` + `.tar.gz` + `BUILD-INFO-*.txt`) + `SHA256SUMS`）。
+- 日常只需 `git push origin main`：`latest` 标签始终跟随最近一次 main 构建，
+  **不需要每次建不同的版本标签**。想冻结某一版留档时，再推 `v*` 标签发版本 Release（可选）。
+- `latest` 与版本 Release 互不影响：版本 Release 只由 `v*` 标签触发，永远不会被 main 推送改写。
+- workflow 只在 `main` 推送与 `v*` 标签推送时构建；`latest` 标签由 workflow 自己推送，
+  既不匹配 `v*`、也不是分支推送，**不会再触发构建/发布循环**。
+
+冻结某一版（可选，与 `latest` 并存）：
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.2.1 && git push origin v0.2.1
 ```
 
-Release 资产命名（12 个 PHP 版本 × 2 libc，共 49 个文件）：
+Release 资产命名（`latest` 与版本 Release 相同：12 个 PHP 版本 × 2 libc，共 49 个文件）：
 
 | 资产 | 说明 |
 |---|---|
@@ -57,7 +75,8 @@ Release 资产命名（12 个 PHP 版本 × 2 libc，共 49 个文件）：
 
 ## 安装与启用
 
-从 GitHub Releases 下载（或改用 CI 的 Actions Artifacts/自己编译）。选包规则：
+从 GitHub Releases 下载（或改用 CI 的 Actions Artifacts/自己编译）。没有特殊需求时直接用
+`latest` Release（当前最新 main 构建）；需要留档历史版本时用对应的 `v*` 版本 Release。选包规则：
 
 1. 先看 libc：Alpine（musl）用 `-musl-` 版，Debian/Ubuntu 等（glibc）用 `-glibc-` 版；
    不确定时看目标环境 `/etc/alpine-release` 是否存在，或 `ldd --version` 的输出。
