@@ -5,60 +5,89 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: php ${{ matrix.php-version }}
+    name: php ${{ matrix.php }} / ${{ matrix.libc }} / x86_64 nts
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-latest (24.04): shivammathur/setup-php supports PHP 7.4+ there;
-        # for very old PHP (<=7.3) you would have to pin ubuntu-22.04.
-        php-version: ["7.4", "8.0", "8.1", "8.2", "8.3", "8.4"]
+        php: ["7.4", "8.0", "8.1", "8.2", "8.3", "8.4"]
+        libc: ["glibc", "musl"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup PHP ${{ matrix.php-version }}
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ matrix.php-version }}
-          coverage: none
-          tools: phpize, php-config
-
-      - name: Build (phpize && configure && make)
+      - name: Resolve container image
         run: |
-          phpize
-          ./configure --enable-mre
-          make -j"$(nproc)"
-
-      - name: Show build warnings
-        if: always()
-        run: |
-          grep -i "warning" $(find . -name "*.log" 2>/dev/null) || true
-
-      - name: Smoke test (load extension)
-        run: |
-          set -e
-          # distro-style layouts keep mysqlnd in a separate mysqlnd.so which must
-          # load first; source-built PHP (setup-php) has mysqlnd built in.
-          if [ -f "$(php-config --extension-dir)/mysqlnd.so" ]; then
-            php -d extension=mysqlnd -d extension=./modules/mre.so -r 'echo "mre loaded (with mysqlnd.so)\n";'
+          set -eu
+          if [ "${{ matrix.libc }}" = "musl" ]; then
+            image="php:${{ matrix.php }}-cli-alpine"
           else
-            php -d extension=./modules/mre.so -r 'echo "mre loaded\n";'
+            image="php:${{ matrix.php }}-cli"
           fi
-          php -d extension=./modules/mre.so -i | grep -A 3 "^mre$"
+          echo "MRE_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "using image: $image"
 
-      - name: Package
+      - name: Pull image and show PHP
         run: |
-          mkdir -p out
-          cp modules/mre.so out/
-          tar -czf mre-${{ matrix.php-version }}-linux-x86_64.tar.gz -C out mre.so
-          ls -la mre-*.tar.gz
+          set -eu
+          docker pull "$MRE_IMAGE"
+          docker run --rm "$MRE_IMAGE" php -v
+          docker run --rm "$MRE_IMAGE" php -i | grep -E '^(PHP API|Thread Safety) =>'
+
+      # The repository is mounted read-only at /src; the container copies it to
+      # /tmp/src and builds there, so nothing (configure/Makefile/modules) is
+      # written back into the checkout. All build logic lives in
+      # .github/scripts/build-mre.sh so it can be reproduced locally:
+      #   docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" \
+      #     -e MRE_PHP_SERIES=7.4 -e MRE_LIBC=musl php:7.4-cli-alpine \
+      #     sh -c 'cp -a /src /tmp/src && sh /tmp/src/.github/scripts/build-mre.sh /tmp/src /out'
+      - name: Build, smoke test and package (inside container)
+        run: |
+          set -eu
+          out="$RUNNER_TEMP/mre-out"
+          mkdir -p "$out"
+          docker run --rm \
+            --name "temp-mre-${{ matrix.php }}-${{ matrix.libc }}-${{ github.run_id }}-${{ github.run_attempt }}" \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$out:/out" \
+            -e "MRE_PHP_SERIES=${{ matrix.php }}" \
+            -e "MRE_LIBC=${{ matrix.libc }}" \
+            -e "MRE_GIT_SHA=$GITHUB_SHA" \
+            -e "MRE_GIT_REF=$GITHUB_REF" \
+            "$MRE_IMAGE" \
+            sh -c 'cp -a /src /tmp/src && sh /tmp/src/.github/scripts/build-mre.sh /tmp/src /out'
+
+      - name: Verify packaged artifacts
+        run: |
+          set -eu
+          base="mre-${{ matrix.php }}-${{ matrix.libc }}-x86_64-nts"
+          out="$RUNNER_TEMP/mre-out"
+          test -f "$out/$base.so"
+          test -f "$out/$base.so.sha256"
+          test -f "$out/$base.tar.gz"
+          test -f "$out/BUILD-INFO"
+          ( cd "$out" && sha256sum -c "$base.so.sha256" )
+          # the BUILD-INFO must describe the matrix entry this job built
+          grep -qx "php_series=${{ matrix.php }}" "$out/BUILD-INFO"
+          grep -qx "libc=${{ matrix.libc }}" "$out/BUILD-INFO"
+          grep -qx "php_zts=nts" "$out/BUILD-INFO"
+          cat "$out/BUILD-INFO"
+          tar -tzf "$out/$base.tar.gz"
+          file "$out/$base.so"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mre-${{ matrix.php-version }}-linux-x86_64
-          path: mre-${{ matrix.php-version }}-linux-x86_64.tar.gz
+          name: mre-${{ matrix.php }}-${{ matrix.libc }}-x86_64-nts
+          path: |
+            ${{ runner.temp }}/mre-out/mre-${{ matrix.php }}-${{ matrix.libc }}-x86_64-nts.so
+            ${{ runner.temp }}/mre-out/mre-${{ matrix.php }}-${{ matrix.libc }}-x86_64-nts.so.sha256
+            ${{ runner.temp }}/mre-out/BUILD-INFO
+            ${{ runner.temp }}/mre-out/mre-${{ matrix.php }}-${{ matrix.libc }}-x86_64-nts.tar.gz
           if-no-files-found: error

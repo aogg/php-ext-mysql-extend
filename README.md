@@ -24,10 +24,17 @@ phpize
 make -j"$(nproc)"
 ```
 
-产物在 `modules/mre.so`。CI 会为 7.4~8.4 各编译一份并打包为
-`mre-<phpver>-linux-x86_64.tar.gz`（见 `.github/workflows/build.yml` 的 Artifacts）。
+产物在 `modules/mre.so`。CI（`.github/workflows/build.yml`，构建脚本
+`.github/scripts/build-mre.sh`）用官方镜像 `php:<ver>-cli`（Debian/glibc）与
+`php:<ver>-cli-alpine`（Alpine/musl）为 7.4~8.4 各编译一份，artifact 名为
+`mre-<phpver>-<glibc|musl>-x86_64-nts`，内含 `mre-<...>.so`、`.sha256`、
+`BUILD-INFO`（PHP 版本/API、ZTS/NTS、libc 与版本、arch、git sha、构建时间）以及同名 `.tar.gz`。
 
 ## 安装与启用
+
+先按目标环境选对 artifact：Alpine（musl）用 `-musl-` 版，Debian/Ubuntu（glibc）用
+`-glibc-` 版；且 PHP 主次版本必须与构建时一致（Zend API 不同，`.so` 不能跨版本混用）。
+镜像里 `mysqlnd` 内置时无需单独加载。
 
 ```ini
 ; php.ini —— 注意顺序（针对 Debian/Ubuntu 等把 mysqlnd 拆成独立 .so 的发行版）：
