@@ -537,6 +537,29 @@ static void mre_script_globals_cleanup(void)
 	zend_hash_str_del(&EG(symbol_table), "___mre_warn", 11);
 }
 
+/*
+ * "the engine is unwinding because the script called exit()/die()".
+ *
+ * Since PHP 8.0 exit is not a bailout but a special exception the VM
+ * unwinds gracefully.  PHP 8.1 introduced zend_is_graceful_exit() for the
+ * destructor variant (declared in Zend/zend_exceptions.h); PHP 8.0 only
+ * declares zend_is_unwind_exit().  Calling the 8.1-only symbol on 8.0 is an
+ * implicit declaration at compile time (warning) and an unresolved symbol
+ * at load time - the resulting module cannot be dlopen()ed by PHP 8.0.
+ * (PHP 7.4 never reaches this code: the caller is guarded by 8.0+.)
+ */
+#if PHP_VERSION_ID >= 80000
+static zend_bool mre_script_is_exit_unwind(zend_object *ex)
+{
+#if PHP_VERSION_ID >= 80100
+	return (zend_bool)(zend_is_unwind_exit(ex) || zend_is_graceful_exit(ex));
+#else
+	/* PHP 8.0: zend_is_graceful_exit() does not exist - unwind check only */
+	return (zend_bool)zend_is_unwind_exit(ex);
+#endif
+}
+#endif
+
 static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
                                 char *out, size_t cap, zend_bool quiet,
                                 char *warn, size_t warn_cap)
@@ -615,8 +638,7 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
 
 #if PHP_VERSION_ID >= 80000
 	if (EG(exception) != NULL && EG(exception) != pending
-			&& (zend_is_unwind_exit(EG(exception))
-				|| zend_is_graceful_exit(EG(exception)))) {
+			&& mre_script_is_exit_unwind(EG(exception))) {
 		/*
 		 * exit()/die() inside the script.  Since PHP 8.0 exit is not a
 		 * bailout but a special exception the VM unwinds gracefully; it
@@ -626,6 +648,13 @@ static zend_bool mre_script_run(const char *path, const mre_script_ctxinfo *ci,
 		 * record silently - whatever the script returned is irrelevant.
 		 * The interrupted code's exception (if any) belonged to us while
 		 * detached and is superseded by the exit - release it.
+		 *
+		 * Which functions identify that exception is version dependent:
+		 * zend_is_unwind_exit() exists since 8.0, zend_is_graceful_exit()
+		 * only since 8.1 (PHP 8.0's Zend/zend_exceptions.h does not
+		 * declare it, and its libphp does not export it), so the test
+		 * lives in mre_script_is_exit_unwind() with per-version guards
+		 * instead of naming both symbols here.
 		 */
 		if (pending != NULL) {
 			zend_objects_store_del(pending);
