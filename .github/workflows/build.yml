@@ -123,6 +123,14 @@ jobs:
   # running), this job moves the permanent `latest` tag to the pushed commit and
   # replaces the assets of the `latest` GitHub Release with the fresh 12 packages.
   # Version releases stay opt-in: push a v* tag to freeze a version.
+  #
+  # Two main pushes can finish their builds in either order. Two guards keep an
+  # older build from rolling `latest` back to an older commit:
+  #   1. the job-level concurrency group below — a newer push starts this job and
+  #      cancels the older run's publishing attempt;
+  #   2. the main-tip check before publishing — a run whose commit is no longer
+  #      the tip of `origin/main` skips publishing and leaves `latest` untouched
+  #      (the job still succeeds; it simply publishes nothing).
   # ---------------------------------------------------------------------------
   latest:
     name: publish latest (rolling)
@@ -130,6 +138,13 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Declared inside `latest` only, so `build` and `release` are neither
+    # serialised nor cancelled. A newer main push reaching this job cancels an
+    # older run's publishing; the main-tip guard below covers the race that
+    # cancellation cannot (a job that already started publishing steps).
+    concurrency:
+      group: mre-latest-release
+      cancel-in-progress: true
     permissions:
       contents: write   # force-move the latest tag + create/update the Release
       actions: read     # read the artifacts produced by this same run
@@ -151,16 +166,47 @@ jobs:
       - name: Merge checksums and verify all 12 packages
         run: sh .github/scripts/verify-release-assets.sh release
 
-      # The tag is moved only after the assets passed verification, so a broken
-      # build can never re-point `latest` at unusable artifacts. `contents:
-      # write` above authorises the push; no PAT is involved.
+      # Race guard: the build for an older main push may finish after the build
+      # for a newer one. Publishing then would force-move `latest` (and rewrite
+      # the Release) back to the older commit, so before touching anything this
+      # run re-reads the real tip of origin/main. A stale run records
+      # current=false and both publishing steps below are skipped; the job ends
+      # green, because a superseded run is not a failure. If the remote tip
+      # cannot be read at all the step fails instead of guessing: publishing
+      # unverified would be worse than not publishing.
+      - name: Check this run is still the tip of main (skip stale runs)
+        id: main_tip
+        run: |
+          set -eu
+          tip=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+          if [ -z "$tip" ]; then
+            echo "::error::无法从 origin 读取 refs/heads/main（git ls-remote 无输出）；无法确认本 run 是否仍是最新提交，本次不发布，latest 保持不动。"
+            exit 1
+          fi
+          echo "remote main tip: $tip"
+          echo "this run SHA   : $GITHUB_SHA"
+          if [ "$tip" = "$GITHUB_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+            echo "本 run 的提交仍是 main 的最新提交，继续发布 latest。"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "跳过 latest 发布：main 已前进到 $tip，本 run 的 $GITHUB_SHA 已过期（旧构建晚于新构建完成）。latest 标签与 Release 保持不动。"
+            echo "::notice title=latest 发布跳过::main tip=$tip，本 run=$GITHUB_SHA，本 run 已过期"
+          fi
+
+      # The tag is moved only after the assets passed verification and the
+      # main-tip guard confirmed this run is current, so neither a broken build
+      # nor a stale run can re-point `latest`. `contents: write` above
+      # authorises the push; no PAT is involved.
       - name: Force-move the latest tag to the built commit
+        if: steps.main_tip.outputs.current == 'true'
         run: |
           set -eu
           git tag -f latest "$GITHUB_SHA"
           git push --force origin refs/tags/latest
 
       - name: Create or update the latest GitHub Release
+        if: steps.main_tip.outputs.current == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest

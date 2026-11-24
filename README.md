@@ -53,6 +53,10 @@ Actions Artifact 名为 `mre-<phpver>-<glibc|musl>-x86_64-nts`，内含 `mre-<..
   （12 ×(`.so` + `.so.sha256` + `.tar.gz` + `BUILD-INFO-*.txt`) + `SHA256SUMS`）。
 - 日常只需 `git push origin main`：`latest` 标签始终跟随最近一次 main 构建，
   **不需要每次建不同的版本标签**。想冻结某一版留档时，再推 `v*` 标签发版本 Release（可选）。
+- **并发推送不会回退**：`latest` job 带 job 级并发组（`mre-latest-release`，
+  `cancel-in-progress: true`），新 main 推送会取消旧 run 的发布 job；即使旧构建仍晚于新构建完成，
+  发布前会再读一次 `origin/main` 的 tip（main-tip 守卫），tip 不是本次提交就只跳过发布、
+  不移动 `latest`、不更新 Release（job 仍为 success）。
 - `latest` 与版本 Release 互不影响：版本 Release 只由 `v*` 标签触发，永远不会被 main 推送改写。
 - workflow 只在 `main` 推送与 `v*` 标签推送时构建；`latest` 标签由 workflow 自己推送，
   既不匹配 `v*`、也不是分支推送，**不会再触发构建/发布循环**。
