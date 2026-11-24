@@ -81,6 +81,20 @@ jobs:
           tar -tzf "$out/$base.tar.gz"
           file "$out/$base.so"
 
+      # Every build job produces a file literally called BUILD-INFO, and the
+      # release job merges all artifacts into one directory (merge-multiple),
+      # where those copies would overwrite each other. Rename it to a
+      # matrix-unique name after the verification above; the .tar.gz keeps
+      # BUILD-INFO under its original name, so build-mre.sh stays untouched.
+      - name: Rename BUILD-INFO to a matrix-unique name
+        run: |
+          set -eu
+          out="$RUNNER_TEMP/mre-out"
+          info="BUILD-INFO-${{ matrix.php }}-${{ matrix.libc }}.txt"
+          mv "$out/BUILD-INFO" "$out/$info"
+          test -f "$out/$info"
+          echo "--- $info ---" && cat "$out/$info"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -88,6 +102,117 @@ jobs:
           path: |
             ${{ runner.temp }}/mre-out/mre-${{ matrix.php }}-${{ matrix.libc }}-x86_64-nts.so
             ${{ runner.temp }}/mre-out/mre-${{ matrix.php }}-${{ matrix.libc }}-x86_64-nts.so.sha256
-            ${{ runner.temp }}/mre-out/BUILD-INFO
+            ${{ runner.temp }}/mre-out/BUILD-INFO-${{ matrix.php }}-${{ matrix.libc }}.txt
             ${{ runner.temp }}/mre-out/mre-${{ matrix.php }}-${{ matrix.libc }}-x86_64-nts.tar.gz
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Release publishing — tag pushes only (v0.2.0 style). Branch pushes, PRs and
+  # manual dispatches stop at the Actions Artifacts above. `needs: build` means
+  # one failing build keeps this job from running at all.
+  # ---------------------------------------------------------------------------
+  release:
+    name: publish release ${{ github.ref_name }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # create/update the GitHub Release and upload assets
+      actions: read     # read the artifacts produced by this same run
+
+    steps:
+      - name: Download every build artifact into one directory
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mre-*
+          path: release
+          merge-multiple: true
+
+      - name: Merge checksums and verify all 12 packages
+        run: |
+          set -eu
+          cd release
+          echo "--- downloaded files ---"
+          ls -l
+
+          # One SHA256SUMS for the whole release. Each build wrote its own
+          # single-entry .so.sha256 with a plain basename, so `-c` resolves
+          # from this directory.
+          cat ./*.so.sha256 > SHA256SUMS
+
+          # 6 PHP series x 2 libc = 12 jobs. needs: build already guarantees
+          # none of them failed; these counts additionally guarantee none
+          # silently produced fewer files. Keep in sync with the matrix.
+          test "$(wc -l < SHA256SUMS)" -eq 12
+          test "$(ls -1 ./*.so | wc -l)" -eq 12
+          test "$(ls -1 ./*.tar.gz | wc -l)" -eq 12
+          test "$(ls -1 ./BUILD-INFO-*.txt | wc -l)" -eq 12
+
+          # Cross-check every BUILD-INFO against its own file name and module,
+          # so a merge mix-up or a mislabelled package cannot reach the release.
+          for f in ./BUILD-INFO-*.txt; do
+            php=$(awk -F= '/^php_series=/{print $2; exit}' "$f")
+            libc=$(awk -F= '/^libc=/{print $2; exit}' "$f")
+            art=$(awk -F= '/^artifact=/{print $2; exit}' "$f")
+            if [ "$f" != "./BUILD-INFO-${php}-${libc}.txt" ]; then
+              echo "BUILD-INFO name/content mismatch: $f (php_series=$php libc=$libc)" >&2
+              exit 1
+            fi
+            if [ ! -f "./$art.so" ]; then
+              echo "module missing for artifact=$art (declared by $f)" >&2
+              exit 1
+            fi
+          done
+
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+          echo "--- sha256sum -c SHA256SUMS ---"
+          sha256sum -c SHA256SUMS
+
+      - name: Create or update the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: mre ${{ github.ref_name }}
+          body: |
+            mre（mysql-redis-extend）PHP 扩展的预编译模块，12 份矩阵产物：
+            PHP 7.4/8.0/8.1/8.2/8.3/8.4 × glibc/musl，x86_64、NTS。
+
+            ## 选择哪个包
+
+            - **Alpine / musl 环境**：`mre-<php>-musl-x86_64-nts.so`（或同名 `.tar.gz`）
+            - **Debian / Ubuntu / glibc 环境**：`mre-<php>-glibc-x86_64-nts.so`（或同名 `.tar.gz`）
+            - `<php>` 必须与本机 PHP **主次版本完全一致**（Zend API 不同，`.so` 不能跨版本混用）
+            - 每个环境具体的 glibc/musl 版本、PHP API 号、编译器与 git sha，
+              见对应的 `BUILD-INFO-<php>-<libc>.txt`
+
+            ## 校验
+
+            ```bash
+            sha256sum -c SHA256SUMS                          # 全量 12 份
+            sha256sum -c mre-8.3-musl-x86_64-nts.so.sha256   # 单个
+            ```
+
+            ## 安装
+
+            ```ini
+            ; php.ini —— mysqlnd 为独立 .so 的发行版必须先加载它
+            extension=mysqlnd.so
+            extension=mre.so
+            ```
+
+            ```bash
+            php -m | grep mre
+            php -i | grep -A 14 '^mre$'
+            ```
+
+            `.tar.gz` 内含 `.so`、`.so.sha256` 与 `BUILD-INFO`（保持原文件名，随包追溯构建环境）。
+          files: |
+            release/*.so
+            release/*.so.sha256
+            release/*.tar.gz
+            release/BUILD-INFO-*.txt
+            release/SHA256SUMS
+          fail_on_unmatched_files: true
+          overwrite_files: true

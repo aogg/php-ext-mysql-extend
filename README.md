@@ -26,14 +26,53 @@ make -j"$(nproc)"
 
 产物在 `modules/mre.so`。CI（`.github/workflows/build.yml`，构建脚本
 `.github/scripts/build-mre.sh`）用官方镜像 `php:<ver>-cli`（Debian/glibc）与
-`php:<ver>-cli-alpine`（Alpine/musl）为 7.4~8.4 各编译一份，artifact 名为
-`mre-<phpver>-<glibc|musl>-x86_64-nts`，内含 `mre-<...>.so`、`.sha256`、
-`BUILD-INFO`（PHP 版本/API、ZTS/NTS、libc 与版本、arch、git sha、构建时间）以及同名 `.tar.gz`。
+`php:<ver>-cli-alpine`（Alpine/musl）为 7.4~8.4 各编译一份（6 PHP × 2 libc = 12 个 job），
+Actions Artifact 名为 `mre-<phpver>-<glibc|musl>-x86_64-nts`，内含 `mre-<...>.so`、`.sha256`、
+`BUILD-INFO-<phpver>-<glibc|musl>.txt`（PHP 版本/API、ZTS/NTS、libc 与版本、arch、git sha、构建时间）
+以及同名 `.tar.gz`（压缩包内仍叫 `BUILD-INFO`）。
+
+### Actions Artifacts 与 GitHub Release 的区别
+
+- **普通 push / PR / 手动 `workflow_dispatch`**：12 个 build job 全部成功后**只上传 Actions Artifacts**，
+  不发 Release（见 run 页面的 Artifacts 区）。
+- **推 tag（如 `v0.2.0`）**：除 Actions Artifacts 外，额外跑一个 `release` job，把 12 份产物合并发布到
+  GitHub Releases。`release` job 带 `needs: build`，**任何一个 build 失败它都不会执行**；
+  它还会先合并生成 `SHA256SUMS` 并 `sha256sum -c` 逐份校验，校验或数量（12 份）不符即失败、不发布。
+
+发版操作：
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Release 资产命名（12 个 PHP 版本 × 2 libc，共 49 个文件）：
+
+| 资产 | 说明 |
+|---|---|
+| `mre-<php>-<libc>-x86_64-nts.so` | 可直接加载的模块，`<libc>` = `glibc` \| `musl` |
+| `mre-<php>-<libc>-x86_64-nts.so.sha256` | 单个模块的校验文件（内容为 basename + 摘要，可在同目录直接 `-c`） |
+| `mre-<php>-<libc>-x86_64-nts.tar.gz` | 上述 `.so`、`.sha256` 与 `BUILD-INFO`（原名）的打包 |
+| `BUILD-INFO-<php>-<libc>.txt` | 该份产物的构建信息（PHP API、ZTS/NTS、libc 版本、编译器、git sha、构建时间） |
+| `SHA256SUMS` | 12 份 `.so` 摘要合并后的总校验文件 |
 
 ## 安装与启用
 
-先按目标环境选对 artifact：Alpine（musl）用 `-musl-` 版，Debian/Ubuntu（glibc）用
-`-glibc-` 版；且 PHP 主次版本必须与构建时一致（Zend API 不同，`.so` 不能跨版本混用）。
+从 GitHub Releases 下载（或改用 CI 的 Actions Artifacts/自己编译）。选包规则：
+
+1. 先看 libc：Alpine（musl）用 `-musl-` 版，Debian/Ubuntu 等（glibc）用 `-glibc-` 版；
+   不确定时看目标环境 `/etc/alpine-release` 是否存在，或 `ldd --version` 的输出。
+2. 再看 PHP 主次版本：`<php>` 必须与本机 PHP **主次版本完全一致**（Zend API 不同，`.so` 不能跨版本混用），
+   `php -v` / `php -i | grep 'PHP API'` 对照资产名。
+3. 具体 glibc/musl 版本、PHP API 号、编译器与 git sha 见对应的 `BUILD-INFO-<php>-<libc>.txt`
+   —— glibc 版本看 `libc_version` 行（musl 同理）。
+
+校验（在放资产的目录执行）：
+
+```bash
+sha256sum -c SHA256SUMS                                  # 全量 12 份
+sha256sum -c mre-8.3-musl-x86_64-nts.so.sha256           # 或只校验单个模块
+```
+
 镜像里 `mysqlnd` 内置时无需单独加载。
 
 ```ini
